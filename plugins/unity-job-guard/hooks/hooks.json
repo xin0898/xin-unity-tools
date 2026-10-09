@@ -1,0 +1,28 @@
+{
+  "description": "Blocks blind sleep-poll loops on Unity side effects and points Claude to ujob.py (detached Unity CLI jobs that always return). Active only inside Unity projects.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/no_blind_unity_poll.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

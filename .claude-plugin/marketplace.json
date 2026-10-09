@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "xin-unity-tools",
+  "description": "Personal Claude Code plugins for Unity work.",
+  "owner": {
+    "name": "xindi"
+  },
+  "plugins": [
+    {
+      "name": "unity-job-guard",
+      "description": "Detached Unity CLI jobs that always return, plus a hook that blocks blind sleep-poll waits on Unity.",
+      "source": "./plugins/unity-job-guard",
+      "category": "development"
+    }
+  ]
+}

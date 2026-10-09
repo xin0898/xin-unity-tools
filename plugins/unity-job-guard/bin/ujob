@@ -1,0 +1,10 @@
+#!/bin/sh
+# ujob: run Unity editor work as a detached Unity CLI job that always returns. See `ujob --help`.
+D="$(cd "$(dirname "$0")/.." && pwd)"
+for py in python3 python py; do
+  if command -v "$py" >/dev/null 2>&1 && "$py" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >/dev/null 2>&1; then
+    exec "$py" -I "$D/scripts/ujob.py" "$@"
+  fi
+done
+echo "ujob: no Python 3.8+ found (tried python3, python, py)" >&2
+exit 4
