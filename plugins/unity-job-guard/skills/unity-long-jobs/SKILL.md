@@ -20,6 +20,7 @@ ujob run -e 'return Foo.Bar();'    # inline code
 ujob wait <JOB_ID>                 # continue after exit 3
 ujob compile                       # recompile, wait through the domain reload, print compiler errors
 ujob ready                         # wait until the editor is idle (after Play Mode / reload)
+ujob waitfile DONE --heartbeat HB  # wait for multi-frame work (see below)
 ```
 
 Options are `--deadline SECONDS` (default 540, under the Bash tool limit) and `--project PATH` (default: the Unity project containing the current directory).
@@ -36,6 +37,26 @@ Write the job to do its work **synchronously** and `return` the result. Detached
 | 5 | project has compile errors; job not started | fix them, then `ujob compile` |
 
 Never treat 1, 2, 4 or 5 as "wait longer".
+
+## Multi-frame work (Play Mode captures, `EditorApplication.update`, coroutines)
+
+Some work has to span frames, so it can't run synchronously. Make it observable:
+1. The callback touches a heartbeat file every tick or step (`File.WriteAllText(hb, DateTime.Now.ToString("o"))`).
+2. When finished it writes the DONE file. On failure, the DONE file's first line starts with `ERROR`.
+3. Wait with `ujob waitfile DONE --heartbeat HB [--stale 20]`.
+
+`waitfile` returns:
+- 0 when the file appears;
+- 1 when the file reports `ERROR`;
+- 2 as soon as the heartbeat goes stale, never starts, or the editor begins a recompile or domain reload;
+- 3 at the deadline while the heartbeat is still fresh (rerun to keep waiting);
+- 4 when the editor is unreachable.
+
+## Unity MCP tools (AnkleBreaker and similar)
+
+- `unity_execute_code` with `EditorApplication.delayCall` is blocked. Run the work synchronously through `ujob run`.
+- After a Unity MCP reply that shows a busy main thread, an unreachable editor, an unknown outcome or a compile in progress, the hook adds a note. Follow it: one bounded `ujob ready` or `ujob compile`, not repeated MCP calls. An "outcome unknown" reply means the request may already have run, so inspect before re-sending.
+- Hooks can't shorten an MCP call that is already waiting. How long a call blocks is decided by the server's retry policy. AnkleBreaker server 2.30 can block a single call for over 10 minutes when the editor is busy; 2.36+ bounds its retries.
 
 ## Rules
 

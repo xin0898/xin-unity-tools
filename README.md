@@ -7,7 +7,11 @@ A personal Claude Code plugin marketplace for Unity work.
 Stops Claude Code from waiting forever on Unity.
 
 - **`ujob`** (on the Bash PATH while the plugin is enabled): runs editor work as a detached Unity CLI job. It always returns: done (0), failed (1), lost to a domain reload (2), deadline (3), no editor (4) or compile errors (5). It also covers `compile` and `ready` waits.
-- **Hook**: in Unity projects, blocks sleep-poll loops on result files, `Editor.log` or background task output. Those loops waited the full 10 minutes whenever the Unity job had silently died.
+- **`ujob waitfile DONE --heartbeat HB`**: waits for multi-frame work (Play Mode captures, update callbacks). It returns as soon as the heartbeat stops or a domain reload starts.
+- **Shell hook**: in Unity projects, blocks sleep-poll loops on result files, `Editor.log` or background task output. Those loops waited the full 10 minutes whenever the Unity job had silently died.
+- **Unity MCP hooks** (any server with `unity_*` tools, e.g. AnkleBreaker):
+  - block `execute_code` that defers work with `EditorApplication.delayCall`;
+  - after replies that show a busy or unreachable editor, an unknown outcome, a compile in progress or newly started multi-frame work, tell Claude to use a bounded `ujob` wait instead of re-calling.
 - **Session note + skill (`unity-long-jobs`)**: tells Claude where `ujob` is and how to use it.
 
 Outside Unity projects the hooks do nothing. A Unity project is a folder with `ProjectSettings/ProjectVersion.txt`.

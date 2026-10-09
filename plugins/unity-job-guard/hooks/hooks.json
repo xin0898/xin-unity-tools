@@ -1,5 +1,5 @@
 {
-  "description": "Blocks blind sleep-poll loops on Unity side effects and points Claude to ujob.py (detached Unity CLI jobs that always return). Active only inside Unity projects.",
+  "description": "Blocks blind waits on Unity: sleep-poll loops on result files/logs (in Unity projects), fire-and-forget delayCall code sent through Unity MCP tools, and adds bounded-wait guidance when a Unity MCP call reports a busy or unreachable editor.",
   "hooks": {
     "SessionStart": [
       {
@@ -19,6 +19,28 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/no_blind_unity_poll.py\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__unity_execute_code",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/mcp_guard.py\" pre",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*__unity_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/mcp_guard.py\" post",
             "timeout": 10
           }
         ]

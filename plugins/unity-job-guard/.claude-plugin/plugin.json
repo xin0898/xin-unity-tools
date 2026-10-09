@@ -1,9 +1,15 @@
 {
   "name": "unity-job-guard",
-  "version": "0.1.0",
-  "description": "Stops Claude from waiting forever on Unity: runs long editor work as detached Unity CLI jobs that always return (done, failed, lost to a domain reload, or deadline) and blocks blind sleep-poll loops on result files and Editor.log.",
+  "version": "0.2.0",
+  "description": "Stops Claude from waiting forever on Unity: detached Unity CLI jobs that always return, heartbeat-checked waits for multi-frame work, a block on blind sleep-poll loops and delayCall fire-and-forget code, and bounded-wait guidance after busy/unreachable Unity MCP replies.",
   "author": {
     "name": "xindi"
   },
-  "keywords": ["unity", "unity-cli", "hooks", "long-running", "polling"]
+  "keywords": [
+    "unity",
+    "unity-cli",
+    "hooks",
+    "long-running",
+    "polling"
+  ]
 }

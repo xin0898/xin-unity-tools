@@ -14,7 +14,7 @@ except Exception:
 if find_unity_project(data.get("cwd") or os.getcwd(), os.environ.get("CLAUDE_PROJECT_DIR")):
     print(
         "unity-job-guard: for Unity editor work longer than ~20 s, or any wait on Unity (compile, Play Mode, "
-        "long eval), use `ujob run FILE.cs|-e CODE`, `ujob wait JOB_ID`, `ujob compile`, `ujob ready` "
+        "long eval), use `ujob run FILE.cs|-e CODE`, `ujob wait JOB_ID`, `ujob compile`, `ujob ready`, and for multi-frame work `ujob waitfile DONE --heartbeat HB` "
         f'(`ujob` is on the Bash PATH; elsewhere run `python "{UJOB}" ...`). '
         "It returns on success, failure, a job lost to a domain reload, or a deadline (exit 0/1/2/3, 4 no editor, "
         "5 compile errors). Do not queue work with EditorApplication.delayCall/update and poll a result file, "

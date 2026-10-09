@@ -7,6 +7,11 @@ Never write `until [ -f result ]; do sleep; done` against Unity. Use this instea
   python ujob.py wait JOB_ID    [--deadline S]   keep waiting on a job that hit its deadline
   python ujob.py compile        [--deadline S]   recompile, wait, report compile errors
   python ujob.py ready          [--deadline S]   wait until the editor is idle (after Play Mode / reload)
+  python ujob.py waitfile DONE  [--heartbeat HB] [--stale S] [--deadline S]
+        wait for a result file written by multi-frame work (EditorApplication.update, coroutines,
+        Play Mode captures). Exits 2 as soon as a domain reload is seen or the heartbeat file stops
+        updating (default 20 s), so a dropped callback never turns into a 10-minute wait.
+        A DONE file whose first line starts with ERROR exits 1.
 
 Options: --project PATH (default: UNITY_PROJECT_PATH, else the Unity project containing the
 current directory, else CLAUDE_PROJECT_DIR).
@@ -143,6 +148,53 @@ def wait_job(job_id, deadline_at, started):
         time.sleep(POLL)
 
 
+def wait_file(done, hb, stale, deadline_at, started):
+    """Wait for `done` while checking that the deferred work is still alive."""
+    say(f"waiting for {done}" + (f" (heartbeat {hb}, stale after {stale}s)" if hb else ""))
+    first_fail = None
+    last_status = 0
+    while True:
+        now = time.time()
+        if os.path.isfile(done):
+            time.sleep(0.5)  # let the writer finish
+            with open(done, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            say(text[:8000])
+            failed = text.lstrip().upper().startswith("ERROR")
+            say(f"{'FILE REPORTS ERROR' if failed else 'DONE'} after {int(now - started)}s")
+            return 1 if failed else 0
+        if hb:
+            if os.path.isfile(hb):
+                age = now - os.path.getmtime(hb)
+                if age > stale:
+                    say(f"JOB LOST: heartbeat {hb} last updated {int(age)}s ago; the callback stopped "
+                        "(domain reload, Play Mode change, exception or scene switch). It will not finish.")
+                    return 2
+            elif now - started > stale:
+                say(f"JOB LOST: no heartbeat at {hb} after {stale}s; the deferred work never started.")
+                return 2
+        if now - last_status > 5:
+            last_status = now
+            st, err = editor_status()
+            if st is not None:
+                first_fail = None
+                if st.get("domainReloadInProgress") or st.get("compiling"):
+                    say("JOB LOST: the editor started a recompile/domain reload; deferred callbacks are dropped. "
+                        "Run `ready`, then start the work again.")
+                    return 2
+            else:
+                first_fail = first_fail or now
+                if now - first_fail > UNREACHABLE_GRACE:
+                    say(f"NO EDITOR: unreachable for {UNREACHABLE_GRACE}s while waiting. Last error: {err}")
+                    return 4
+        if now > deadline_at:
+            say(f"DEADLINE after {int(now - started)}s: {done} not written yet"
+                + (" (heartbeat still fresh, so it is probably still running)" if hb else "")
+                + ". Rerun the same waitfile to keep waiting.")
+            return 3
+        time.sleep(2)
+
+
 def report(job_id, data, started):
     res = data.get("result") or {}
     secs = int(time.time() - started)
@@ -230,6 +282,14 @@ def main(argv):
 
     if verb == "wait":
         return wait_job(args[0], deadline_at, started)
+
+    if verb == "waitfile":
+        if not args:
+            say("waitfile needs the result file path")
+            return 64
+        hb = take_opt(args, "--heartbeat")
+        stale = int(take_opt(args, "--stale", 20))
+        return wait_file(native_path(args[0]), native_path(hb) if hb else None, stale, deadline_at, started)
 
     if verb == "compile":
         rc = wait_ready(deadline_at, quiet=True)
