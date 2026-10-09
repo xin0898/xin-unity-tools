@@ -36,13 +36,27 @@ Outside Unity projects the hooks do nothing. A Unity project is a folder with `P
 
 Edits to the folder load at the next session start, or with `/reload-plugins`.
 
-**Other machines (after pushing this repo to GitHub):**
+**Other machines:** the repo is private (`xin0898/xin-unity-tools`), so first give Git access to GitHub on that machine:
+
+```bash
+gh auth login
+```
+
+```bash
+gh auth setup-git
+```
+
+(Install the GitHub CLI first, e.g. `winget install GitHub.cli` on Windows or `brew install gh` on macOS.) Then add to `~/.claude/settings.json`:
 
 ```json
 "extraKnownMarketplaces": {
-  "xin-unity-tools": { "source": { "source": "github", "repo": "<owner>/xin-unity-tools" } }
+  "xin-unity-tools": { "source": { "source": "github", "repo": "xin0898/xin-unity-tools" } }
 },
 "enabledPlugins": { "unity-job-guard@xin-unity-tools": true }
 ```
 
-Alternatively, use the desktop Code tab (**+ → Plugins → Add plugin**) or the CLI (`/plugin marketplace add <owner>/xin-unity-tools`, then `/plugin install unity-job-guard@xin-unity-tools`). Bump `version` in `plugin.json` when you push changes, so copies installed from GitHub update.
+Alternatively, use the desktop Code tab (**+ → Plugins → Add plugin**) or the CLI (`/plugin marketplace add xin0898/xin-unity-tools`, then `/plugin install unity-job-guard@xin-unity-tools`).
+
+### Updating
+
+Edit the files here, bump `version` in `plugins/unity-job-guard/.claude-plugin/plugin.json`, commit and `git push`. This machine loads the local folder directly (`/reload-plugins`); machines installed from GitHub pick up the new version on their next update.
