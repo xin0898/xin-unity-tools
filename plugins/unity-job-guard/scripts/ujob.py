@@ -97,7 +97,9 @@ def wait_ready(deadline_at, quiet=False):
         st, err = editor_status()
         if st is not None:
             first_fail = None
-            busy = st.get("compiling") or st.get("domainReloadInProgress") or st.get("status") not in (None, "ready")
+            # Play Mode reports "playing"/"paused"; the editor still runs jobs then, so treat it as idle.
+            busy = (st.get("compiling") or st.get("domainReloadInProgress")
+                    or st.get("status") not in (None, "ready", "playing", "paused"))
             if not busy:
                 return None
             note = f"editor busy: status={st.get('status')} compiling={st.get('compiling')} reload={st.get('domainReloadInProgress')}"
