@@ -1,5 +1,5 @@
 {
-  "description": "Blocks blind waits on Unity: sleep-poll loops on result files/logs (in Unity projects), fire-and-forget delayCall code sent through Unity MCP tools, and adds bounded-wait guidance when a Unity MCP call reports a busy or unreachable editor.",
+  "description": "Blocks blind waits on Unity: sleep-poll loops on result files/logs (in Unity projects), fire-and-forget delayCall code sent through Unity MCP tools, and adds bounded-wait guidance when a Unity MCP call reports a busy or unreachable editor, and reminds Claude to arm the `ujob stalewatch` monitor whenever Unity work runs in the background.",
   "hooks": {
     "SessionStart": [
       {
@@ -20,6 +20,11 @@
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/no_blind_unity_poll.py\"",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/background_watch.py\" pre",
+            "timeout": 10
           }
         ]
       },
@@ -35,6 +40,16 @@
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/background_watch.py\" post",
+            "timeout": 10
+          }
+        ]
+      },
       {
         "matcher": "mcp__.*__unity_.*",
         "hooks": [

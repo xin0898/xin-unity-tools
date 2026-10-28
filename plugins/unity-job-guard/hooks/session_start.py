@@ -19,5 +19,8 @@ if find_unity_project(data.get("cwd") or os.getcwd(), os.environ.get("CLAUDE_PRO
         "It returns on success, failure, a job lost to a domain reload, or a deadline (exit 0/1/2/3, 4 no editor, "
         "5 compile errors). Do not queue work with EditorApplication.delayCall/update and poll a result file, "
         "and do not write sleep loops on Editor.log or task output; a hook blocks those. "
+        "To check that code compiles, or to run pure-logic Edit Mode tests, without waiting for the editor "
+        "(parallel-safe, also while another session drives Unity): `ujob offline-compile [--overlay DIR]` and "
+        "`ujob offline-test [--filter Fixture]`; finish with one real `ujob compile` before calling a change done. "
         "Details: the unity-long-jobs skill.")
 sys.exit(0)

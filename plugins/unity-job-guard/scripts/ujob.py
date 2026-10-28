@@ -12,6 +12,24 @@ Never write `until [ -f result ]; do sleep; done` against Unity. Use this instea
         Play Mode captures). Exits 2 as soon as a domain reload is seen or the heartbeat file stops
         updating (default 20 s), so a dropped callback never turns into a 10-minute wait.
         A DONE file whose first line starts with ERROR exits 1.
+  python ujob.py stalewatch [--root DIR] [--interval 60] [--stale 60] [--idle 180]
+        staleness watchdog for background Unity work; run it through the Monitor tool (each stdout
+        line is a notification). Every --interval seconds it scans job folders (a `heartbeat` file,
+        default root <project>/TempArtifacts/Logs) and the editor, and prints one line per event:
+          STALE     a job's heartbeat is older than --stale s and it has no DONE: the job died
+          FINISHED  a watched job wrote DONE (first line included)
+          EDITOR    the editor is unreachable for 90 s, or started a recompile/domain reload
+          IDLE      no job has been running for --idle s: a background driver (loop, script) that
+                    should start the next job has stalled or ended. The watch then exits.
+  python ujob.py offline-compile [--all] [--assembly NAME] [--overlay DIR] [--keep]
+        compile the project's own assemblies WITHOUT the editor, by replaying Unity's last compiler
+        command lines (Library/Bee) with Unity's Roslyn. Safe to run in parallel with each other and
+        with a busy editor; writes only to TempArtifacts/Scratch/OfflineCompile. Exit 0 / 5 / 4.
+        Details: scripts/offline_compile.py.
+  python ujob.py offline-test [--filter TEXT] [--timeout S] [--all] [--overlay DIR]
+        offline-compile, then run the Edit Mode NUnit tests in plain .NET. Tests that reach the
+        native engine are reported as needs-editor, not failures. Exit 0 / 1 failures / 5 / 4.
+        Details: scripts/offline_test.py.
 
 Options: --project PATH (default: UNITY_PROJECT_PATH, else the Unity project containing the
 current directory, else CLAUDE_PROJECT_DIR).
@@ -197,6 +215,75 @@ def wait_file(done, hb, stale, deadline_at, started):
         time.sleep(2)
 
 
+def job_dirs(root, recent):
+    """Folders under `root` (3 levels) holding a heartbeat touched in the last `recent` seconds."""
+    found, now = [], time.time()
+    base = root.rstrip("/\\").count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath.count(os.sep) - base >= 3:
+            dirnames[:] = []
+        if "heartbeat" in filenames:
+            hb = os.path.join(dirpath, "heartbeat")
+            done = os.path.join(dirpath, "DONE")
+            stamp = max(os.path.getmtime(hb), os.path.getmtime(done) if os.path.isfile(done) else 0)
+            if now - stamp < recent:
+                found.append(dirpath)
+    return found
+
+
+def stale_watch(root, interval, stale, idle):
+    """Emit one line per staleness event (Monitor notifications); exit once nothing has run for `idle` s."""
+    def emit(msg):
+        print(msg, flush=True)
+
+    started = time.time()
+    reported, finished = set(), set()
+    last_activity = started
+    unreachable_since, reload_reported = None, False
+    emit(f"WATCHING {root} every {interval}s (stale {stale}s, idle {idle}s)")
+    while True:
+        now = time.time()
+        running = 0
+        for d in job_dirs(root, 900):  # older folders are past runs, not this watch's business
+            hb, done = os.path.join(d, "heartbeat"), os.path.join(d, "DONE")
+            if os.path.isfile(done):
+                last_activity = max(last_activity, os.path.getmtime(done))
+                if d not in finished and os.path.getmtime(done) >= started - interval:
+                    finished.add(d)
+                    with open(done, encoding="utf-8", errors="replace") as f:
+                        first = (f.readline() or "").strip()
+                    emit(f"FINISHED {d}: {first[:240]}")
+                continue
+            age = now - os.path.getmtime(hb)
+            if age > stale:
+                if d not in reported:
+                    reported.add(d)
+                    emit(f"STALE {d}: heartbeat {int(age)}s old and no DONE; the job died. "
+                         "Check the editor (`ujob ready`) and rerun it.")
+            else:
+                running += 1
+                last_activity = now
+        st, err = editor_status()
+        if st is None:
+            unreachable_since = unreachable_since or now
+            if now - unreachable_since > UNREACHABLE_GRACE:
+                emit(f"EDITOR unreachable for {int(now - unreachable_since)}s: {err}")
+                unreachable_since = now  # repeat at most every grace period
+        else:
+            unreachable_since = None
+            busy = st.get("domainReloadInProgress") or st.get("compiling")
+            if busy and not reload_reported:
+                emit("EDITOR started a recompile/domain reload: deferred jobs are dropped.")
+            reload_reported = bool(busy)
+            if busy:
+                last_activity = now
+        if running == 0 and now - last_activity > idle:
+            emit(f"IDLE {int(now - last_activity)}s: no Unity job is running. If a background task should "
+                 "have started the next job, it has stalled: check it, stop it and continue by hand.")
+            return 0
+        time.sleep(interval)
+
+
 def report(job_id, data, started):
     res = data.get("result") or {}
     secs = int(time.time() - started)
@@ -269,6 +356,11 @@ def main(argv):
     if not PROJECT:
         say("NO UNITY PROJECT: run from inside a Unity project, set UNITY_PROJECT_PATH, or pass --project PATH.")
         return 64
+    if verb in ("offline-compile", "offline-test"):
+        sys.path.insert(0, os.path.dirname(SELF))
+        import offline_compile
+        import offline_test
+        return (offline_compile if verb == "offline-compile" else offline_test).main(PROJECT, args)
     if not UNITY:
         say("NO UNITY CLI: `unity` is not on PATH. Install it from https://unity.com (Unity CLI) and reopen the shell.")
         return 4
@@ -292,6 +384,11 @@ def main(argv):
         hb = take_opt(args, "--heartbeat")
         stale = int(take_opt(args, "--stale", 20))
         return wait_file(native_path(args[0]), native_path(hb) if hb else None, stale, deadline_at, started)
+
+    if verb == "stalewatch":
+        root = native_path(take_opt(args, "--root", os.path.join(PROJECT, "TempArtifacts", "Logs")))
+        return stale_watch(os.path.abspath(root), int(take_opt(args, "--interval", 60)),
+                           int(take_opt(args, "--stale", 60)), int(take_opt(args, "--idle", 180)))
 
     if verb == "compile":
         rc = wait_ready(deadline_at, quiet=True)
