@@ -86,7 +86,7 @@ def main(project, args):
     if not runner:
         say(f"NO TEST RUNNER: {err}")
         return 4
-    opts["keep"] = True
+    opts["keep"] = opts["internal"] = True  # keep the DLLs for the runner; removed below
     rc, ctx = oc.build(project, opts)
     if rc != 0:  # compile errors were printed; their log stays in the compile folder
         return rc

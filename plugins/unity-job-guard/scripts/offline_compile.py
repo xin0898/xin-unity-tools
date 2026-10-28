@@ -361,5 +361,5 @@ def build(project, opts):
         say(f"full log: {os.path.join(out_dir, 'compile.log')}")
         return (5, ctx)
     say(f"COMPILED OK offline in {elapsed:.1f}s ({summary}; {warnings} warnings)"
-        + (f"\noutput kept in {out_dir}" if keep else ""))
+        + (f"\noutput kept in {out_dir}" if keep and not opts.get("internal") else ""))
     return (0, ctx)
