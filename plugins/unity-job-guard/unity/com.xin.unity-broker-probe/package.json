@@ -1,0 +1,8 @@
+{
+  "name": "com.xin.unity-broker-probe",
+  "version": "0.5.0",
+  "displayName": "Unity Broker Probe",
+  "description": "Editor-only probe for the unity-job-guard broker (xin-unity-tools). Writes Library/UnityBrokerProbe/state.json with the editor's real state (epoch, compiles, Play, unsaved scenes, busy long runners, MCP actions) and keeps automatic asset refresh off so only explicit refreshes compile. No compile-time references: everything project- or package-specific is reached by reflection.",
+  "unity": "2021.3",
+  "author": { "name": "xindi" }
+}

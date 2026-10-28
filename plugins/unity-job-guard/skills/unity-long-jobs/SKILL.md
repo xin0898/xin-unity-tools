@@ -1,6 +1,6 @@
 ---
 name: unity-long-jobs
-description: How to run and wait on Unity editor work without blind waits. Use for any Unity eval that may take longer than ~20 s, recompiles, waiting for the editor after Play Mode or a domain reload, long bakes or map/terrain builds, or whenever you are about to poll a result file, Editor.log or a background task's output for Unity.
+description: How to run and wait on Unity editor work without blind waits, and how several sessions share one Unity editor through the broker (leases, batched tests, coalesced compiles, exit codes 6/7). Use for any Unity eval that may take longer than ~20 s, recompiles, Play Mode, scene switches, waiting for the editor after Play Mode or a domain reload, long bakes or map/terrain builds, hands-on Play work (captures, perf windows), or whenever you are about to poll a result file, Editor.log or a background task's output for Unity.
 ---
 
 # Waiting on Unity without dead waits
@@ -17,8 +17,9 @@ Blind waits are the failure to avoid: queuing work in Unity, then sleep-polling 
 ```bash
 ujob run path/to/job.cs            # eval_file as a detached CLI job; waits up to 540 s
 ujob run -e 'return Foo.Bar();'    # inline code
-ujob wait <JOB_ID>                 # continue after exit 3
-ujob compile                       # recompile, wait through the domain reload, print compiler errors
+ujob run --read -e 'return X.Status();'  # a lookup that changes nothing: never waits for other sessions
+ujob wait <JOB_ID>                 # continue after exit 3 (T-<ticket> for broker requests)
+ujob compile                       # refresh + recompile, wait through the domain reload, print compiler errors
 ujob ready                         # wait until the editor is idle (after Play Mode / reload)
 ujob waitfile DONE --heartbeat HB  # wait for multi-frame work (see below)
 ```
@@ -34,9 +35,26 @@ Write the job to do its work **synchronously** and `return` the result. Detached
 | 2 | job lost (reload, Play Mode, restart): it did **not** finish | `ujob ready`, then rerun |
 | 3 | deadline hit, still running | `ujob wait <JOB_ID>` |
 | 4 | editor unreachable or no Unity CLI | check Unity: modal dialog, Safe Mode (`unity pipeline list`), crash |
-| 5 | project has compile errors; job not started | fix them, then `ujob compile` |
+| 5 | compile errors (in your files, when other sessions are active); job not started | fix them, then `ujob compile` |
+| 6 | not started: another session holds the editor, a long job runs, the user has unsaved scenes, or the broker is paused (the reason is printed) | do other work, retry later; check `ujob status` |
+| 7 | ran on the last good build, which lacks your listed changes (another session's files are broken) | **not validated**: wait for the fix, compile, rerun |
 
-Never treat 1, 2, 4 or 5 as "wait longer".
+Never treat 1, 2, 4 or 5 as "wait longer", and never report 7 as a pass.
+
+## Several sessions, one editor: the broker
+
+Every `ujob run`, `compile`, `test`, `lease` and `import` goes through the **broker**, a small per-project daemon `ujob` starts on demand (state in `%LOCALAPPDATA%/xin-unity-tools/broker/`). It decides when the shared editor compiles, switches scenes or enters Play Mode; it adds about 0.2 s per call.
+
+- **Lookups never wait:** `ujob run --read` (or an eval that is exactly `return Agent.Status();` / `Help` / `Get` / `Find` ...) runs at once, also during another session's lease or test batch.
+- **Tests:** `ujob test TAG|*|script.json|NAME --fixture [--session S] [--map M]` (AI Unit Testing projects). The broker compiles if code changed, boots once, runs, stops Play. Requests from several sessions share one Play session; with two or more active sessions a request waits up to 60 s for others.
+- **Hands-on Play or long edit work:** `ujob lease play MODE [--scene official|test|PATH] [--director|--aitest]` returns once Play is ready; then your `ujob run` calls (and Unity MCP calls) are the only mutating ones allowed. `ujob lease edit` does the same without Play. **Always `ujob lease release` when done.** A lease is released after 30 idle minutes (warning at 25; a running `ujob waitfile` counts as activity), when your session ends, or by `ujob broker release --force`.
+- **Implicit lease:** an eval that boots Play or opens a scene (`AITestAgent.Boot`, `PlayModeAgent.Boot`, `DirectorAgent.Boot`, `OpenScene` ...) gives your session the lease; it is released 5 s after you are back in Edit Mode. The old `ujob run -e 'return AITestAgent.Boot();'` → Run → Stop flow keeps working.
+- **Compiles:** requests coalesce (one compile serves everyone queued); "up to date" when nothing changed. With two or more active sessions an offline compile gates the real one, so one session's broken file never puts the editor into an error state: that session gets 5, others get 7 if their own changes are missing. `--force` skips the gate.
+- **Automatic refresh is off** (the probe package): files you write compile only on `ujob compile`; non-script assets you write (PNG, FBX, JSON) need `ujob import PATH...`.
+- **Agents first, with limits:** the broker stops a Play session nobody leases (e.g. started by hand) before its work, but never saves or discards unsaved scenes ("blocked: user" instead) and waits while a long editor job (Hub build, mountain chain, road paint...) is busy. `ujob broker pause` / `resume` holds all agent Unity work.
+- **See who does what:** `ujob status`. Say what your session does with `ujob register --role implementation|testing|coordination --brief "..."`. Agents without a Claude session (Codex) pass `--as NAME`.
+- **Unity MCP:** Play/scene/compile-triggering tools (`unity_play_mode`, `scene_open`, `script_create`, Play/Refresh menu items, execute_code that boots Play) need the lease; scene-changing tools wait while another session holds it or a batch runs. Raw `unity command eval/recompile/run_tests` in Bash is blocked; use ujob. Emergency bypass: `UJOB_DIRECT=1 ujob ...`.
+- **Setup per project:** `ujob broker setup` installs the probe package (`Packages/com.xin.unity-broker-probe`, check it in) and sets "Recompile After Finished Playing"; then `ujob compile --force`. Project specifics (busy flags, boot keys, map scenes) live in `ProjectSettings/UnityBrokerProbe.json`.
 
 ## Without the editor: `offline-compile` and `offline-test`
 

@@ -293,7 +293,8 @@ def build(project, opts):
             for s in a.sources:
                 f.write(f'"{overlay_files.get(s, s)}"\n')
         t = time.time()
-        p = subprocess.run([dotnet, "exec", csc, "/noconfig", f"@{rsp}"], cwd=project,
+        p = subprocess.run([dotnet, "exec", csc, "/noconfig", f"@{rsp}"], cwd=project, stdin=subprocess.DEVNULL,
+                           creationflags=0x08000000 if os.name == "nt" else 0,
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         return name, p.returncode, p.stdout + p.stderr, time.time() - t
 

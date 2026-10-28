@@ -12,7 +12,18 @@ Stops Claude Code from waiting forever on Unity.
 - **Unity MCP hooks** (any server with `unity_*` tools, e.g. AnkleBreaker):
   - block `execute_code` that defers work with `EditorApplication.delayCall`;
   - after replies that show a busy or unreachable editor, an unknown outcome, a compile in progress or newly started multi-frame work, tell Claude to use a bounded `ujob` wait instead of re-calling.
+- **Broker (0.5.0)**: lets several sessions share one editor. A per-project daemon, started on demand, schedules every `ujob run/compile/test/lease/import`:
+  - **compiles** coalesce, with an offline gate so one session's broken file never breaks the others;
+  - **AI tests** (`ujob test`) from several sessions share one Play session;
+  - **hands-on work** gets an exclusive lease (`ujob lease play|edit|release`);
+  - **read-only lookups** (`ujob run --read`) never wait.
+
+  New exit codes: 6 (not started, reason printed) and 7 (ran on a stale build: not validated). `ujob status` shows who holds the editor.
+- **Unity probe package** (`unity/com.xin.unity-broker-probe`, installed into a project with `ujob broker setup`): reports the editor's real state to the broker and keeps automatic asset refresh off. Project specifics go in `ProjectSettings/UnityBrokerProbe.json`.
+- **Offline checks**: `ujob offline-compile` / `ujob offline-test` compile and run pure Edit Mode tests without the editor.
+- **Broker hooks**: register and end sessions, remind lease holders, record which session wrote each script, keep Play/scene/compile-triggering Unity MCP calls to the lease holder (failing closed) and block raw `unity command eval/recompile` that bypasses the broker.
 - **Session note + skill (`unity-long-jobs`)**: tells Claude where `ujob` is and how to use it.
+- **Tests**: `python -m pytest plugins/unity-job-guard/tests` (scheduler logic against a fake editor).
 
 Outside Unity projects the hooks do nothing. A Unity project is a folder with `ProjectSettings/ProjectVersion.txt`.
 

@@ -1,5 +1,5 @@
 {
-  "description": "Blocks blind waits on Unity: sleep-poll loops on result files/logs (in Unity projects), fire-and-forget delayCall code sent through Unity MCP tools, and adds bounded-wait guidance when a Unity MCP call reports a busy or unreachable editor, and reminds Claude to arm the `ujob stalewatch` monitor whenever Unity work runs in the background.",
+  "description": "Blocks blind waits on Unity: sleep-poll loops on result files/logs (in Unity projects), fire-and-forget delayCall code sent through Unity MCP tools, and adds bounded-wait guidance when a Unity MCP call reports a busy or unreachable editor, and reminds Claude to arm the `ujob stalewatch` monitor whenever Unity work runs in the background. Ties sessions to the Unity broker: registers and ends sessions, records which session wrote which script (blame hints), reminds lease holders, keeps Play/scene/compile-triggering Unity MCP calls to the editor lease holder (failing closed) and blocks raw Unity CLI calls that bypass the broker.",
   "hooks": {
     "SessionStart": [
       {
@@ -7,6 +7,33 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/session_start.py\"",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" session-end",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" stop",
             "timeout": 10
           }
         ]
@@ -25,6 +52,11 @@
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/background_watch.py\" pre",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" bash",
+            "timeout": 10
           }
         ]
       },
@@ -37,6 +69,26 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "mcp__.*__unity_(play_mode|scene_open|scene_new|build|script_create|script_update|execute_menu_item|advanced_tool|execute_code)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun_closed.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" mcp",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__unity_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" mcp",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -46,6 +98,16 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/background_watch.py\" post",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/pyrun.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/broker_hooks.py\" post-edit",
             "timeout": 10
           }
         ]

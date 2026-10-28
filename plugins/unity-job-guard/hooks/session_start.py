@@ -22,5 +22,9 @@ if find_unity_project(data.get("cwd") or os.getcwd(), os.environ.get("CLAUDE_PRO
         "To check that code compiles, or to run pure-logic Edit Mode tests, without waiting for the editor "
         "(parallel-safe, also while another session drives Unity): `ujob offline-compile [--overlay DIR]` and "
         "`ujob offline-test [--filter Fixture]`; finish with one real `ujob compile` before calling a change done. "
+        "Sessions share the editor through the broker: `ujob test TAG` for AI tests, `ujob lease play MODE` / "
+        "`ujob lease release` for hands-on Play, `ujob run --read` for lookups; exit 6 = not started (reason "
+        "printed), exit 7 = ran on a stale build (not validated); `ujob status` shows who holds the editor; "
+        "`ujob register --role R --brief TEXT` says what this session does. "
         "Details: the unity-long-jobs skill.")
 sys.exit(0)

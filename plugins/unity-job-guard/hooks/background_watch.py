@@ -33,8 +33,15 @@ if not re.search(r"\bujob\b|unity|AITestAgent|PlayModeAgent|DirectorAgent|waitfi
 if mode == "pre":
     triggered = bool(tool_input.get("run_in_background"))
 else:
-    response = json.dumps(data.get("tool_response") or "")
-    triggered = bool(re.search(r"backgrounded|running in background|run_in_background", response, re.IGNORECASE))
+    # Only the response's own metadata: the command's stdout/stderr can contain any text (this hook used to fire
+    # on a plain `cat` of a file that mentions run_in_background).
+    resp = data.get("tool_response")
+    if isinstance(resp, dict):
+        resp = {k: v for k, v in resp.items() if k not in ("stdout", "stderr", "output", "content")}
+    elif isinstance(resp, str):
+        resp = resp[:400] if re.match(r"^\s*(Command|Command was)", resp) else ""
+    response = json.dumps(resp or "")
+    triggered = bool(re.search(r"backgroundTaskId|backgrounded|moved to the background", response, re.IGNORECASE))
 if not triggered:
     sys.exit(0)
 

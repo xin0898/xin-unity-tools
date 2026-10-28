@@ -1,46 +1,57 @@
 """Run Unity editor work through the Unity CLI and always come back with a definite answer.
 
-Never write `until [ -f result ]; do sleep; done` against Unity. Use this instead:
+Several sessions share one editor, so editor work goes through the broker (a per-project daemon that starts
+on demand): it decides when Unity compiles, switches scenes or enters Play Mode, batches AI tests, and hands
+each requester its own result. Never write `until [ -f result ]; do sleep; done` against Unity.
 
-  python ujob.py run  FILE.cs   [--deadline S]   eval_file as a detached job, wait for it
-  python ujob.py run  -e "CODE" [--deadline S]   same for inline code
-  python ujob.py wait JOB_ID    [--deadline S]   keep waiting on a job that hit its deadline
-  python ujob.py compile        [--deadline S]   recompile, wait, report compile errors
-  python ujob.py ready          [--deadline S]   wait until the editor is idle (after Play Mode / reload)
-  python ujob.py waitfile DONE  [--heartbeat HB] [--stale S] [--deadline S]
-        wait for a result file written by multi-frame work (EditorApplication.update, coroutines,
-        Play Mode captures). Exits 2 as soon as a domain reload is seen or the heartbeat file stops
-        updating (default 20 s), so a dropped callback never turns into a 10-minute wait.
-        A DONE file whose first line starts with ERROR exits 1.
-  python ujob.py stalewatch [--root DIR] [--interval 60] [--stale 60] [--idle 180]
-        staleness watchdog for background Unity work; run it through the Monitor tool (each stdout
-        line is a notification). Every --interval seconds it scans job folders (a `heartbeat` file,
-        default root <project>/TempArtifacts/Logs) and the editor, and prints one line per event:
-          STALE     a job's heartbeat is older than --stale s and it has no DONE: the job died
-          FINISHED  a watched job wrote DONE (first line included)
-          EDITOR    the editor is unreachable for 90 s, or started a recompile/domain reload
-          IDLE      no job has been running for --idle s: a background driver (loop, script) that
-                    should start the next job has stalled or ended. The watch then exits.
-  python ujob.py offline-compile [--all] [--assembly NAME] [--overlay DIR] [--keep]
-        compile the project's own assemblies WITHOUT the editor, by replaying Unity's last compiler
-        command lines (Library/Bee) with Unity's Roslyn. Safe to run in parallel with each other and
-        with a busy editor; writes only to TempArtifacts/Scratch/OfflineCompile. Exit 0 / 5 / 4.
-        Details: scripts/offline_compile.py.
-  python ujob.py offline-test [--filter TEXT] [--timeout S] [--all] [--overlay DIR]
-        offline-compile, then run the Edit Mode NUnit tests in plain .NET. Tests that reach the
-        native engine are reported as needs-editor, not failures. Exit 0 / 1 failures / 5 / 4.
-        Details: scripts/offline_test.py.
+Editor work (through the broker):
+  ujob run  FILE.cs | -e "CODE" [--read]   eval as a detached job and wait. --read promises the eval changes
+                                           nothing: it then runs at once, even during another session's lease
+                                           or batch (a whole eval `return X.Status();` counts as read on its own)
+  ujob compile [--force]                   refresh assets, compile, report errors (coalesced across sessions;
+                                           --force skips the offline gate)
+  ujob test SPEC [--fixture] [--session S] [--visuals] [--map test|official]
+                                           AI Unit Testing: SPEC is a tag, "*", a script .json or (--fixture) a C#
+                                           fixture name. Each test runs on the map it declares ("any" = test map;
+                                           --map forces one). Tests of several sessions share one Play session.
+  ujob lease play [MODE] [--scene official|test|PATH] [--director | --aitest [--session S] [--visuals]]
+  ujob lease edit [--why TEXT]             hold the editor for hands-on work (captures, perf windows, debugging,
+  ujob lease release                       long edit jobs). Nobody else's mutating work runs until you release it.
+  ujob import PATH...                      import non-script assets (automatic refresh is off)
+  ujob wait T-TICKET                       keep waiting on a broker request that hit its deadline
 
-Options: --project PATH (default: UNITY_PROJECT_PATH, else the Unity project containing the
-current directory, else CLAUDE_PROJECT_DIR).
+Waits and checks (direct, no broker):
+  ujob wait JOB_ID [--deadline S]          keep waiting on a Unity CLI job
+  ujob ready [--deadline S]                wait until the editor is idle (after Play Mode / reload)
+  ujob waitfile DONE [--heartbeat HB] [--stale S] [--deadline S]
+        wait for a result file written by multi-frame work. Exits 2 as soon as a domain reload is seen or the
+        heartbeat stops updating (default 20 s). A DONE file whose first line starts with ERROR exits 1.
+  ujob stalewatch [--root DIR] [--interval 60] [--stale 60] [--idle 180]
+        staleness watchdog for background Unity work; run it through the Monitor tool.
+  ujob offline-compile [--all] [--assembly NAME] [--overlay DIR] [--keep]
+  ujob offline-test [--filter TEXT] [--timeout S] [--all] [--overlay DIR]
+        compile / run pure Edit Mode tests WITHOUT the editor (parallel-safe). Details: offline_compile.py.
+
+Coordination:
+  ujob status [--json]                     sessions, lease holder and idle time, queue, running work, editor
+                                           state from the probe, broken files, pause state
+  ujob register --role ROLE --brief TEXT   say what this session does (coordination|implementation|testing)
+  ujob broker start|stop|pause|resume|log|restore-scene|setup [--restore]|release --force|session-end [SESSION]
+
+Options: --project PATH (default: UNITY_PROJECT_PATH, else the Unity project containing the current directory,
+else CLAUDE_PROJECT_DIR), --as NAME (identity for agents without a Claude session id, e.g. Codex), --deadline S,
+--blocked-wait S (how long a blocked request waits before giving up with exit 6; default 120).
+UJOB_DIRECT=1 bypasses the broker (emergencies; the daemon itself uses it).
 
 Exit codes (every path ends in one of these; nothing waits silently):
   0 done        the job finished and returned success
-  1 job failed  the snippet threw or did not compile; the error is printed
+  1 job failed  the snippet threw or did not compile, or tests failed; the error is printed
   2 job lost    a domain reload, Play Mode entry or editor restart dropped the job; it did NOT finish
-  3 deadline    still running when the deadline hit; rerun `wait JOB_ID` (the job keeps going)
+  3 deadline    still running when the deadline hit; rerun `wait JOB_ID` / `wait T-TICKET` (the job keeps going)
   4 no editor   the editor stayed unreachable (crashed, modal dialog, stuck reload) or no Unity CLI
-  5 compile     the project has compile errors, so the job was not started
+  5 compile     compile errors (in your files, when other sessions are active); the job was not started
+  6 not started blocked, paused or cancelled: the reason is printed (lease holder, busy runner, unsaved scenes)
+  7 stale build the work ran on the last good build, which lacks your listed changes: NOT validated
  64 usage       bad arguments or no Unity project found
 
 The default deadline (540 s) stays under the Bash tool's 600 s limit.
@@ -50,258 +61,27 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 
-PROJECT = None  # resolved in main()
-UNITY = shutil.which("unity") or next(
-    (p for p in (os.path.expandvars(r"%LOCALAPPDATA%\Unity\bin\unity.exe"),
-                 os.path.expanduser("~/.unity/bin/unity"), "/usr/local/bin/unity")
-     if os.path.isfile(p)), None)
-SELF = os.path.abspath(__file__).replace("\\", "/")
-POLL = 3
-UNREACHABLE_GRACE = 90  # a domain reload of the dev project can take this long
-DEFAULT_DEADLINE = 540
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import broker_common as bc  # noqa: E402
+import unity_cli as uc  # noqa: E402
 
-
-def cli(*args, timeout=60):
-    """Run the Unity CLI with --json; return (ok, data, error_text)."""
-    cmd = [UNITY, *args, "--project-path", PROJECT, "--json", "--no-banner"]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, None, f"CLI call timed out after {timeout}s: {' '.join(args[:2])}"
-    out = p.stdout.strip()
-    try:
-        doc = json.loads(out[out.index("{"):]) if "{" in out else None
-    except ValueError:
-        doc = None
-    if doc is None:
-        return False, None, (out or p.stderr.strip() or f"exit {p.returncode}")[:2000]
-    if not doc.get("success", False):
-        errs = doc.get("errors") or []
-        text = "; ".join((e.get("message") or e.get("code") or str(e)) if isinstance(e, dict) else str(e)
-                         for e in errs) or out
-        return False, doc.get("data"), text[:2000]
-    return True, doc.get("data"), None
+SELF = uc.SELF
+DEFAULT_DEADLINE = uc.DEFAULT_DEADLINE
+PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROBE_PACKAGE = "com.xin.unity-broker-probe"
+PROBE_CONFIG_TEMPLATE = {
+    "busy": [],
+    "bootKeys": [],
+    "broker": {"maps": {}, "defaultMap": "test",
+               "stopPlay": "UnityEditor.EditorApplication.ExitPlaymode(); return \"{\\\"ok\\\":true}\";"},
+}
 
 
 def say(msg):
     print(msg, flush=True)
-
-
-def editor_status():
-    ok, data, err = cli("command", "editor_status", timeout=20)
-    if ok and isinstance(data, dict):
-        return data.get("result", data), None
-    return None, err
-
-
-def compile_state():
-    ok, data, _ = cli("command", "console_status", timeout=20)
-    if ok and isinstance(data, dict):
-        gt = (data.get("result") or data).get("groundTruth") or {}
-        return gt.get("compiling"), gt.get("compilationFailed")
-    return None, None
-
-
-def wait_ready(deadline_at, quiet=False):
-    """Wait until the editor is reachable, idle and not compiling. Returns an exit code or None."""
-    first_fail = None
-    last_note = 0
-    while True:
-        st, err = editor_status()
-        if st is not None:
-            first_fail = None
-            # Play Mode reports "playing"/"paused"; the editor still runs jobs then, so treat it as idle.
-            busy = (st.get("compiling") or st.get("domainReloadInProgress")
-                    or st.get("status") not in (None, "ready", "playing", "paused"))
-            if not busy:
-                return None
-            note = f"editor busy: status={st.get('status')} compiling={st.get('compiling')} reload={st.get('domainReloadInProgress')}"
-        else:
-            first_fail = first_fail or time.time()
-            if time.time() - first_fail > UNREACHABLE_GRACE:
-                say(f"NO EDITOR: unreachable for {UNREACHABLE_GRACE}s. Last error: {err}")
-                say("Check: is Unity running, is a modal dialog open (save scene? safe mode?), run `unity pipeline list`.")
-                return 4
-            note = f"editor unreachable ({err[:120] if err else '?'}), retrying"
-        if time.time() > deadline_at:
-            say(f"DEADLINE: editor still not ready ({note}).")
-            return 4
-        if not quiet and time.time() - last_note > 30:
-            say(note)
-            last_note = time.time()
-        time.sleep(POLL)
-
-
-def wait_job(job_id, deadline_at, started):
-    first_fail = None
-    last_note = time.time()
-    while True:
-        ok, data, err = cli("job", "status", job_id, timeout=30)
-        if ok and isinstance(data, dict):
-            first_fail = None
-            state = data.get("state")
-            if state in ("completed", "failed", "cancelled", "canceled"):
-                return report(job_id, data, started)
-            if time.time() - last_note > 60:
-                prog = data.get("progress")
-                say(f"[{int(time.time() - started)}s] job {state}" + (f" progress={prog}" if prog else ""))
-                last_note = time.time()
-        elif err and ("Not Found" in err or "not found" in err or "No job" in err):
-            say(f"JOB LOST after {int(time.time() - started)}s: {err}")
-            say("The job did not finish. Usual cause: a recompile, Play Mode entry/exit or scene reload during the run. "
-                f'Run `python "{SELF}" ready`, then start it again.')
-            return 2
-        else:
-            first_fail = first_fail or time.time()
-            if time.time() - first_fail > UNREACHABLE_GRACE:
-                say(f"NO EDITOR: job status unreachable for {UNREACHABLE_GRACE}s. Last error: {err}")
-                return 4
-        if time.time() > deadline_at:
-            say(f"DEADLINE after {int(time.time() - started)}s: job {job_id} is still running.")
-            say(f'Continue with: python "{SELF}" wait {job_id}')
-            return 3
-        time.sleep(POLL)
-
-
-def wait_file(done, hb, stale, deadline_at, started):
-    """Wait for `done` while checking that the deferred work is still alive."""
-    say(f"waiting for {done}" + (f" (heartbeat {hb}, stale after {stale}s)" if hb else ""))
-    first_fail = None
-    last_status = 0
-    while True:
-        now = time.time()
-        if os.path.isfile(done):
-            time.sleep(0.5)  # let the writer finish
-            with open(done, encoding="utf-8", errors="replace") as f:
-                text = f.read()
-            say(text[:8000])
-            failed = text.lstrip().upper().startswith("ERROR")
-            say(f"{'FILE REPORTS ERROR' if failed else 'DONE'} after {int(now - started)}s")
-            return 1 if failed else 0
-        if hb:
-            if os.path.isfile(hb):
-                age = now - os.path.getmtime(hb)
-                if age > stale:
-                    say(f"JOB LOST: heartbeat {hb} last updated {int(age)}s ago; the callback stopped "
-                        "(domain reload, Play Mode change, exception or scene switch). It will not finish.")
-                    return 2
-            elif now - started > stale:
-                say(f"JOB LOST: no heartbeat at {hb} after {stale}s; the deferred work never started.")
-                return 2
-        if now - last_status > 5:
-            last_status = now
-            st, err = editor_status()
-            if st is not None:
-                first_fail = None
-                if st.get("domainReloadInProgress") or st.get("compiling"):
-                    say("JOB LOST: the editor started a recompile/domain reload; deferred callbacks are dropped. "
-                        "Run `ready`, then start the work again.")
-                    return 2
-            else:
-                first_fail = first_fail or now
-                if now - first_fail > UNREACHABLE_GRACE:
-                    say(f"NO EDITOR: unreachable for {UNREACHABLE_GRACE}s while waiting. Last error: {err}")
-                    return 4
-        if now > deadline_at:
-            say(f"DEADLINE after {int(now - started)}s: {done} not written yet"
-                + (" (heartbeat still fresh, so it is probably still running)" if hb else "")
-                + ". Rerun the same waitfile to keep waiting.")
-            return 3
-        time.sleep(2)
-
-
-def job_dirs(root, recent):
-    """Folders under `root` (3 levels) holding a heartbeat touched in the last `recent` seconds."""
-    found, now = [], time.time()
-    base = root.rstrip("/\\").count(os.sep)
-    for dirpath, dirnames, filenames in os.walk(root):
-        if dirpath.count(os.sep) - base >= 3:
-            dirnames[:] = []
-        if "heartbeat" in filenames:
-            hb = os.path.join(dirpath, "heartbeat")
-            done = os.path.join(dirpath, "DONE")
-            stamp = max(os.path.getmtime(hb), os.path.getmtime(done) if os.path.isfile(done) else 0)
-            if now - stamp < recent:
-                found.append(dirpath)
-    return found
-
-
-def stale_watch(root, interval, stale, idle):
-    """Emit one line per staleness event (Monitor notifications); exit once nothing has run for `idle` s."""
-    def emit(msg):
-        print(msg, flush=True)
-
-    started = time.time()
-    reported, finished = set(), set()
-    last_activity = started
-    unreachable_since, reload_reported = None, False
-    emit(f"WATCHING {root} every {interval}s (stale {stale}s, idle {idle}s)")
-    while True:
-        now = time.time()
-        running = 0
-        for d in job_dirs(root, 900):  # older folders are past runs, not this watch's business
-            hb, done = os.path.join(d, "heartbeat"), os.path.join(d, "DONE")
-            if os.path.isfile(done):
-                last_activity = max(last_activity, os.path.getmtime(done))
-                if d not in finished and os.path.getmtime(done) >= started - interval:
-                    finished.add(d)
-                    with open(done, encoding="utf-8", errors="replace") as f:
-                        first = (f.readline() or "").strip()
-                    emit(f"FINISHED {d}: {first[:240]}")
-                continue
-            age = now - os.path.getmtime(hb)
-            if age > stale:
-                if d not in reported:
-                    reported.add(d)
-                    emit(f"STALE {d}: heartbeat {int(age)}s old and no DONE; the job died. "
-                         "Check the editor (`ujob ready`) and rerun it.")
-            else:
-                running += 1
-                last_activity = now
-        st, err = editor_status()
-        if st is None:
-            unreachable_since = unreachable_since or now
-            if now - unreachable_since > UNREACHABLE_GRACE:
-                emit(f"EDITOR unreachable for {int(now - unreachable_since)}s: {err}")
-                unreachable_since = now  # repeat at most every grace period
-        else:
-            unreachable_since = None
-            busy = st.get("domainReloadInProgress") or st.get("compiling")
-            if busy and not reload_reported:
-                emit("EDITOR started a recompile/domain reload: deferred jobs are dropped.")
-            reload_reported = bool(busy)
-            if busy:
-                last_activity = now
-        if running == 0 and now - last_activity > idle:
-            emit(f"IDLE {int(now - last_activity)}s: no Unity job is running. If a background task should "
-                 "have started the next job, it has stalled: check it, stop it and continue by hand.")
-            return 0
-        time.sleep(interval)
-
-
-def report(job_id, data, started):
-    res = data.get("result") or {}
-    secs = int(time.time() - started)
-    if data.get("state") == "completed" and isinstance(res, dict) and res.get("success", True) and not data.get("error"):
-        if res.get("output"):
-            say(f"output: {res['output']}")
-        say(json.dumps(res.get("result", res), ensure_ascii=False, indent=2) if not isinstance(res.get("result"), str)
-            else res["result"])
-        say(f"DONE in {secs}s (job {job_id})")
-        return 0
-    say(f"JOB FAILED after {secs}s (state={data.get('state')}):")
-    detail = {k: v for k, v in (res if isinstance(res, dict) else {}).items()
-              if k in ("error", "errorDetails", "message", "diagnostics", "output") and v}
-    if data.get("error"):
-        detail["jobError"] = data.get("error")
-        detail["jobErrorDetails"] = data.get("errorDetails")
-    say(json.dumps(detail or res, ensure_ascii=False, indent=2)[:6000])
-    return 1
 
 
 def take_opt(args, name, default=None):
@@ -311,6 +91,13 @@ def take_opt(args, name, default=None):
         del args[i:i + 2]
         return val
     return default
+
+
+def take_flag(args, name):
+    if name in args:
+        args.remove(name)
+        return True
+    return False
 
 
 def native_path(p):
@@ -344,38 +131,256 @@ def resolve_project(explicit):
     return None
 
 
+# ── Talking to the broker ────────────────────────────────────────────────────────────────────────
+
+class Client:
+    def __init__(self, project, ident, act):
+        self.project, self.ident, self.act = project, ident, act
+        self.sdir = bc.state_dir(project)
+        self.blocked_wait = None
+
+    def request(self, op, payload, deadline_at):
+        if self.blocked_wait is not None:
+            payload["blocked_wait"] = self.blocked_wait
+        if not bc.ensure_daemon(self.project, self.sdir):
+            say("NO BROKER: the broker daemon did not start (see its log: `ujob broker log`). "
+                "Emergency bypass: UJOB_DIRECT=1.")
+            return 4
+        rid, attached = bc.submit(self.sdir, self.ident, op, payload)
+        if attached:
+            say(f"[broker] attached to the identical request {rid} that is still in flight")
+        return self.await_response(rid, deadline_at)
+
+    def await_response(self, rid, deadline_at):
+        path = bc.response_path(self.sdir, rid)
+        last_note, last_alive, started = None, 0, time.time()
+        while True:
+            if os.path.isfile(path):
+                doc = bc.read_json(path)
+                if doc is not None:
+                    bc.remove(path)
+                    out = doc.get("output") or ""
+                    if out:
+                        say(out)
+                    return int(doc.get("rc", 1))
+            now = time.time()
+            self.act.beat()
+            if now - last_alive > 2:
+                last_alive = now
+                if not bc.daemon_alive(self.sdir):
+                    say("[broker] daemon not running; starting it again (your request stays queued)")
+                    bc.ensure_daemon(self.project, self.sdir)
+            note = self.position(rid)
+            if note and note != last_note:
+                say(f"[broker] {note}")
+                last_note = note
+            if now > deadline_at:
+                bc.mark_keep(self.sdir, rid)
+                say(f"DEADLINE after {int(now - started)}s: request {rid} is {last_note or 'still queued'}.")
+                say(f"It keeps its place. Continue with: ujob wait T-{rid}")
+                return 3
+            time.sleep(0.1 if now - started < 3 else 0.25)
+
+    def position(self, rid):
+        st = bc.read_json(os.path.join(self.sdir, "state.json"), {}) or {}
+        run = st.get("running") or {}
+        if rid in (run.get("ids") or []):
+            return f"running: {run.get('op')}"
+        if any(r.get("id") == rid for r in st.get("reads") or []):
+            return "running (read lane)"
+        for i, r in enumerate(st.get("pending") or []):
+            if r.get("id") == rid:
+                return f"queued #{i + 1}" + (f" — {r['waitingFor']}" if r.get("waitingFor") else "")
+        return None
+
+
+# ── Status ───────────────────────────────────────────────────────────────────────────────────────
+
+def ago(t):
+    if not t:
+        return "never"
+    s = int(time.time() - t)
+    return f"{s}s ago" if s < 120 else f"{s // 60} min ago" if s < 7200 else f"{s // 3600} h ago"
+
+
+def status(project, as_json):
+    sdir = bc.state_dir(project)
+    st = bc.read_json(os.path.join(sdir, "state.json"), {}) or {}
+    alive = bc.daemon_alive(sdir)
+    reg = bc.registry(sdir)
+    act = bc.session_activity(sdir)
+    probe = bc.read_json(os.path.join(project, "Library", "UnityBrokerProbe", "state.json"))
+    if as_json:
+        say(json.dumps({"daemon": alive, "state": st, "sessions": reg, "activity": act, "probe": probe},
+                       ensure_ascii=False, indent=1))
+        return 0
+    say(f"broker: {'running' if alive else 'not running (starts on the next request)'}"
+        + (f", pid {st.get('daemonPid')}, up {ago(st.get('started')).replace(' ago', '')}" if alive else "")
+        + (", PAUSED" if st.get("paused") or os.path.isfile(os.path.join(sdir, "paused")) else ""))
+    lease = st.get("lease") if alive else bc.read_json(os.path.join(sdir, "lease.json"))
+    if lease:
+        r = reg.get(lease["session"], {})
+        idle = lease.get("idleSeconds")
+        say(f"LEASE: {lease['session'][:8]} ({r.get('role', '?')}: {r.get('brief') or 'no brief'}) holds the editor "
+            f"[{lease.get('kind')}{', implicit' if lease.get('implicit') else ''}] since {ago(lease.get('since'))}"
+            + (f", idle {idle // 60} min" if idle is not None else "")
+            + ("  ** idle warning: released at 30 min **" if lease.get("warn") else ""))
+    else:
+        say("lease: none")
+    run = st.get("running")
+    if run and alive:
+        say(f"running: {run.get('op')} for {', '.join(s[:8] for s in run.get('sessions') or [])}")
+    for r in (st.get("pending") or []) if alive else []:
+        say(f"  queued {r['id']} {r['op']} {r['session'][:8]} {ago(r.get('since'))}"
+            + (f" — {r['waitingFor']}" if r.get("waitingFor") else ""))
+    if st.get("brokenFiles"):
+        say(f"BROKEN BUILD since {ago(st.get('brokenSince'))}: {', '.join(st['brokenFiles'][:10])} "
+            "(sessions without broken files run on the last good build)")
+    if st.get("priorScene"):
+        say(f"scene before the last batch: {st['priorScene']} (`ujob broker restore-scene`)")
+    say("sessions:")
+    for s, r in sorted(reg.items(), key=lambda kv: -(act.get(bc.safe_name(kv[0]), {}).get("last") or 0)):
+        if r.get("endedAt"):
+            continue
+        a = act.get(bc.safe_name(s), {})
+        say(f"  {s[:8]} {r.get('role', '?'):<14} {(r.get('brief') or '-')[:60]:<60} last call {ago(a.get('last'))}"
+            + (f", {a['running']} running" if a.get("running") else ""))
+    if probe:
+        fresh = time.time() - probe.get("writtenUnix", 0) < 15
+        busy = [b["name"] for b in probe.get("busy") or [] if b.get("busy")]
+        dirty = [x["path"] or "(untitled)" for x in probe.get("scenes") or [] if x.get("dirty")]
+        lc = probe.get("lastCompile") or {}
+        say(f"editor: {'Play' if probe.get('playing') else 'Edit'} Mode, scene {probe.get('activeScene')}"
+            + (f", UNSAVED: {', '.join(dirty)}" if dirty else "")
+            + (f", busy: {', '.join(busy)}" if busy else "")
+            + (f", last compile {'OK' if lc.get('succeeded') else 'FAILED'} {ago(lc.get('finishedUnix'))}" if lc.get("finishedUnix") else "")
+            + (f", auto refresh {'OFF' if probe.get('autoRefreshGuard') else 'on'}")
+            + ("" if fresh else f"  (probe last wrote {ago(probe.get('writtenUnix'))}: editor busy, closed or a modal dialog)"))
+        for prob in probe.get("problems") or []:
+            say(f"  probe: {prob}")
+    else:
+        say("editor: no probe state (run `ujob broker setup`, then `ujob compile`)")
+    return 0
+
+
+# ── Setup ────────────────────────────────────────────────────────────────────────────────────────
+
+def setup(project, client, restore, deadline_at):
+    sdir = client.sdir
+    backup = os.path.join(sdir, "prefs_backup.json")
+    if restore:
+        old = (bc.read_json(backup, {}) or {}).get("ScriptCompilationDuringPlay", 0)
+        code = (f'UnityEditor.EditorPrefs.SetInt("ScriptCompilationDuringPlay", {int(old)}); '
+                'var t = System.Type.GetType("Xin.UnityBroker.UnityBrokerProbe, Xin.UnityBrokerProbe.Editor"); '
+                'var m = t == null ? null : t.GetMethod("SetAutoRefreshGuard"); '
+                'return "pref restored" + (m == null ? "" : "; " + m.Invoke(null, new object[] { false }));')
+        return client.request("eval", {"code": code}, deadline_at)
+    src = os.path.join(PLUGIN, "unity", PROBE_PACKAGE)
+    dst = os.path.join(project, "Packages", PROBE_PACKAGE)
+    copied = []
+    for d, _, files in os.walk(src):
+        for fn in files:
+            rel = os.path.relpath(os.path.join(d, fn), src)
+            target = os.path.join(dst, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(os.path.join(d, fn), "rb") as a:
+                data = a.read()
+            old = open(target, "rb").read() if os.path.isfile(target) else None
+            if old != data:
+                with open(target, "wb") as b:
+                    b.write(data)
+                copied.append(rel.replace("\\", "/"))
+    say(f"probe package {'updated: ' + ', '.join(copied) if copied else 'already up to date'} ({dst})")
+    cfg = os.path.join(project, "ProjectSettings", "UnityBrokerProbe.json")
+    if not os.path.isfile(cfg):
+        bc.write_json(cfg, PROBE_CONFIG_TEMPLATE)
+        say(f"wrote a config template: {cfg} (add busy flags, boot keys and map scenes)")
+    code = ('var old = UnityEditor.EditorPrefs.GetInt("ScriptCompilationDuringPlay", 0); '
+            'UnityEditor.EditorPrefs.SetInt("ScriptCompilationDuringPlay", 1); return old.ToString();')
+    ok, res, err = uc.quick_eval(code)
+    if ok:
+        if not os.path.isfile(backup):
+            bc.write_json(backup, {"ScriptCompilationDuringPlay": int(res or 0), "at": time.time()})
+        say(f"Script Changes While Playing: Recompile After Finished Playing (was {res}; per user, so all your projects)")
+    else:
+        say(f"could not set the Play-compile preference: {err}")
+    if copied:
+        # A new embedded package is only compiled after Package Manager resolves it.
+        uc.quick_eval("UnityEditor.PackageManager.Client.Resolve(); return \"resolve requested\";")
+        say("Now run `ujob compile --force` so Unity loads the probe.")
+    return 0
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────────────────────────
+
 def main(argv):
-    global PROJECT
     args = list(argv)
     if not args or args[0] in ("-h", "--help", "help"):
         say(__doc__)
         return 64
-    verb = args.pop(0)
     deadline = int(take_opt(args, "--deadline", DEFAULT_DEADLINE))
-    PROJECT = resolve_project(take_opt(args, "--project"))
-    if not PROJECT:
+    as_name = take_opt(args, "--as")
+    project = resolve_project(take_opt(args, "--project"))
+    if not args:
+        say(__doc__)
+        return 64
+    verb = args.pop(0)
+    if not project:
         say("NO UNITY PROJECT: run from inside a Unity project, set UNITY_PROJECT_PATH, or pass --project PATH.")
         return 64
-    if verb in ("offline-compile", "offline-test"):
-        sys.path.insert(0, os.path.dirname(SELF))
-        import offline_compile
-        import offline_test
-        return (offline_compile if verb == "offline-compile" else offline_test).main(PROJECT, args)
-    if not UNITY:
-        say("NO UNITY CLI: `unity` is not on PATH. Install it from https://unity.com (Unity CLI) and reopen the shell.")
-        return 4
+    uc.configure(project)
     started = time.time()
     deadline_at = started + deadline
 
+    if verb in ("offline-compile", "offline-test"):
+        import offline_compile
+        import offline_test
+        return (offline_compile if verb == "offline-compile" else offline_test).main(project, args)
+
+    ident = bc.identity(as_name)
+    sdir = bc.state_dir(project)
+    act = bc.Activity(sdir, ident)
+    uc.ON_POLL = act.beat
+    try:
+        return dispatch(verb, args, project, ident, act, deadline_at, started)
+    finally:
+        act.close()
+
+
+def dispatch(verb, args, project, ident, act, deadline_at, started):
+    if verb == "status":
+        return status(project, take_flag(args, "--json"))
+
+    if verb == "register":
+        role, brief = take_opt(args, "--role"), take_opt(args, "--brief")
+        if role and role not in ("coordination", "implementation", "testing"):
+            say("--role must be coordination, implementation or testing")
+            return 64
+        rec = bc.register(bc.state_dir(project), ident, role, brief, os.getcwd())
+        say(f"registered {rec['session'][:8]} as {rec['role']}: {rec.get('brief') or '(no brief)'}")
+        return 0
+
+    if not uc.UNITY:
+        say("NO UNITY CLI: `unity` is not on PATH. Install it from https://unity.com (Unity CLI) and reopen the shell.")
+        return 4
+
     if verb == "ready":
-        rc = wait_ready(deadline_at)
+        rc = uc.wait_ready(deadline_at)
         if rc is None:
             say(f"READY after {int(time.time() - started)}s")
             return 0
         return rc
 
+    client = Client(project, ident, act)
+    bw = take_opt(args, "--blocked-wait")
+    client.blocked_wait = int(bw) if bw else None
     if verb == "wait":
-        return wait_job(args[0], deadline_at, started)
+        if not args:
+            say("wait needs a JOB_ID or T-TICKET")
+            return 64
+        if args[0].startswith("T-"):
+            return client.await_response(args[0][2:], deadline_at)
+        return uc.wait_job(args[0], deadline_at, started)
 
     if verb == "waitfile":
         if not args:
@@ -383,63 +388,124 @@ def main(argv):
             return 64
         hb = take_opt(args, "--heartbeat")
         stale = int(take_opt(args, "--stale", 20))
-        return wait_file(native_path(args[0]), native_path(hb) if hb else None, stale, deadline_at, started)
+        return uc.wait_file(native_path(args[0]), native_path(hb) if hb else None, stale, deadline_at, started)
 
     if verb == "stalewatch":
-        root = native_path(take_opt(args, "--root", os.path.join(PROJECT, "TempArtifacts", "Logs")))
-        return stale_watch(os.path.abspath(root), int(take_opt(args, "--interval", 60)),
-                           int(take_opt(args, "--stale", 60)), int(take_opt(args, "--idle", 180)))
+        root = native_path(take_opt(args, "--root", os.path.join(project, "TempArtifacts", "Logs")))
+        return uc.stale_watch(os.path.abspath(root), int(take_opt(args, "--interval", 60)),
+                              int(take_opt(args, "--stale", 60)), int(take_opt(args, "--idle", 180)))
 
-    if verb == "compile":
-        rc = wait_ready(deadline_at, quiet=True)
-        if rc is not None:
-            return rc
-        ok, data, err = cli("command", "recompile", "--timeout", "30", timeout=60)
-        if not ok:
-            say(f"recompile request: {err} (continuing to watch compile state)")
-        time.sleep(2)
-        rc = wait_ready(deadline_at)
-        if rc is not None:
-            return rc
-        compiling, failed = compile_state()
-        if failed:
-            _, data, _ = cli("command", "recompile_status", timeout=30)
-            errors = ((data or {}).get("result") or data or {}).get("errors") or []
-            say("COMPILE FAILED:")
-            say("\n".join(errors[:30]) if errors else "(no compiler messages returned; check `unity command console --level error`)")
-            return 5
-        say(f"COMPILED OK in {int(time.time() - started)}s")
-        return 0
+    direct = os.environ.get("UJOB_DIRECT") == "1" or os.environ.get("UJOB_BROKER") == "0"
+    bc.register(client.sdir, ident) if not os.path.isfile(
+        os.path.join(client.sdir, "registry", bc.safe_name(ident["session"]) + ".json")) else None
 
     if verb == "run":
+        read = take_flag(args, "--read")
         if not args:
             say("run needs FILE.cs or -e CODE")
             return 64
-        rc = wait_ready(deadline_at, quiet=True)
-        if rc is not None:
-            return rc
-        _, failed = compile_state()
-        if failed:
-            say("COMPILE ERRORS in the project: not starting the job (it would run stale code or fail). "
-                f'Fix them, then `python "{SELF}" compile`.')
-            return 5
         if args[0] == "-e":
-            launch = ("command", "eval", "--code", args[1], "--detach")
+            if len(args) < 2:
+                say("run -e needs CODE")
+                return 64
+            payload = {"code": args[1]}
         else:
             path = os.path.abspath(native_path(args[0]))
             if not os.path.isfile(path):
                 say(f"no such file: {path}")
                 return 64
-            launch = ("command", "eval_file", "--file", path, "--detach")
-        ok, data, err = cli(*launch, timeout=60)
-        job_id = isinstance(data, dict) and (data.get("jobId") or (data.get("result") or {}).get("jobId"))
-        if not ok or not job_id:
-            say(f"LAUNCH FAILED: {err or data}")
-            if err and re.search(r"unknown option|--detach", err, re.I):
-                say("This Unity CLI has no detached jobs. Update the Unity CLI and the com.unity.pipeline package.")
-            return 1
-        say(f"job {job_id} started")
-        return wait_job(job_id, deadline_at, started)
+            payload = {"file": path}
+        if read:
+            payload["read"] = True
+        if direct:
+            return uc.run_eval(payload.get("code"), payload.get("file"), deadline_at, started)
+        return client.request("eval", payload, deadline_at)
+
+    if verb == "compile":
+        if direct:
+            return uc.compile_project(deadline_at, started)
+        return client.request("compile", {"force": take_flag(args, "--force")}, deadline_at)
+
+    if verb == "test":
+        fixture = take_flag(args, "--fixture")
+        visuals = take_flag(args, "--visuals")
+        session = take_opt(args, "--session")
+        force_map = take_opt(args, "--map")
+        if not args:
+            say("test needs a SPEC: a tag, \"*\", a script .json, or --fixture NAME")
+            return 64
+        spec = args[0]
+        if spec.lower().endswith(".json") and os.path.isfile(native_path(spec)):
+            spec = os.path.relpath(os.path.abspath(native_path(spec)), project).replace("\\", "/")
+        payload = {"spec": spec, "fixture": fixture, "visuals": visuals, "session": session}
+        if force_map:
+            payload["map"] = force_map
+        return client.request("test", payload, deadline_at)
+
+    if verb == "lease":
+        sub = args.pop(0) if args else ""
+        if sub == "play":
+            payload = {"mode": args.pop(0) if args and not args[0].startswith("--") else "MapInspection",
+                       "scene": take_opt(args, "--scene"), "session": take_opt(args, "--session"),
+                       "visuals": take_flag(args, "--visuals"),
+                       "variant": "director" if take_flag(args, "--director") else "aitest" if take_flag(args, "--aitest") else None}
+            return client.request("lease_play", payload, deadline_at)
+        if sub == "edit":
+            return client.request("lease_edit", {"why": take_opt(args, "--why", "")}, deadline_at)
+        if sub == "release":
+            return client.request("lease_release", {}, deadline_at)
+        say("lease play|edit|release")
+        return 64
+
+    if verb == "import":
+        if not args:
+            say("import needs asset paths (project-relative, e.g. Assets/Art/foo.png)")
+            return 64
+        paths = [os.path.relpath(os.path.abspath(native_path(p)), project).replace("\\", "/") if os.path.isabs(native_path(p)) else p.replace("\\", "/")
+                 for p in args]
+        return client.request("import", {"paths": paths}, deadline_at)
+
+    if verb == "broker":
+        sub = args.pop(0) if args else ""
+        if sub == "start":
+            ok = bc.ensure_daemon(project, client.sdir)
+            say("broker running" if ok else "broker did not start (see `ujob broker log`)")
+            return 0 if ok else 4
+        if sub == "log":
+            p = os.path.join(client.sdir, "broker.log")
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    say("".join(f.readlines()[-int(take_opt(args, "--lines", 60)):]))
+            return 0
+        if sub == "setup":
+            return setup(project, client, take_flag(args, "--restore"), deadline_at)
+        if sub == "restore-scene":
+            return client.request("restore_scene", {}, deadline_at)
+        if sub == "release":
+            if not take_flag(args, "--force"):
+                say("broker release needs --force (it takes the editor lease from its holder)")
+                return 64
+            return client.request("release_force", {}, deadline_at)
+        if sub in ("pause", "resume", "stop"):
+            if sub == "stop" and not bc.daemon_alive(client.sdir):
+                say("broker not running")
+                return 0
+            return client.request(sub, {}, deadline_at)
+        if sub == "session-end":
+            target = args[0] if args else ident["session"]
+            if not bc.daemon_alive(client.sdir):
+                rec_path = os.path.join(client.sdir, "registry", bc.safe_name(target) + ".json")
+                rec = bc.read_json(rec_path)
+                if rec:
+                    rec["endedAt"] = time.time()
+                    bc.write_json(rec_path, rec)
+                lease = bc.read_json(os.path.join(client.sdir, "lease.json"))
+                if lease and lease.get("session") == target:
+                    bc.remove(os.path.join(client.sdir, "lease.json"))
+                return 0
+            return client.request("session_end", {"session": target}, deadline_at)
+        say("broker start|stop|pause|resume|log|restore-scene|setup [--restore]|release --force|session-end [SESSION]")
+        return 64
 
     say(f"unknown verb {verb}\n{__doc__}")
     return 64
