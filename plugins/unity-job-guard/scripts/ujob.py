@@ -10,10 +10,12 @@ Editor work (through the broker):
                                            or batch (a whole eval `return X.Status();` counts as read on its own)
   ujob compile [--force]                   refresh assets, compile, report errors (coalesced across sessions;
                                            --force skips the offline gate)
-  ujob test SPEC [--fixture] [--session S] [--visuals] [--map test|official]
-                                           AI Unit Testing: SPEC is a tag, "*", a script .json or (--fixture) a C#
+  ujob test SPEC [--fixture] [--session S] [--visuals] [--map test|official] [--data]
+                                           AI Unit Testing: SPEC is a tag, a suite, "*", a script .json or (--fixture) a C#
                                            fixture name. Each test runs on the map it declares ("any" = test map;
                                            --map forces one). Tests of several sessions share one Play session.
+                                           --data boots the map's sim scene (data backend: no UI or visuals); a suite
+                                           (Tests/AITests/Suites/NAME.json) brings its own map, session and backend.
   ujob lease play [MODE] [--scene official|test|PATH] [--director | --aitest [--session S] [--visuals]]
   ujob lease edit [--why TEXT]             hold the editor for hands-on work (captures, perf windows, debugging,
   ujob lease release                       long edit jobs). Nobody else's mutating work runs until you release it.
@@ -431,13 +433,14 @@ def dispatch(verb, args, project, ident, act, deadline_at, started):
         visuals = take_flag(args, "--visuals")
         session = take_opt(args, "--session")
         force_map = take_opt(args, "--map")
+        data = take_flag(args, "--data")
         if not args:
             say("test needs a SPEC: a tag, \"*\", a script .json, or --fixture NAME")
             return 64
         spec = args[0]
         if spec.lower().endswith(".json") and os.path.isfile(native_path(spec)):
             spec = os.path.relpath(os.path.abspath(native_path(spec)), project).replace("\\", "/")
-        payload = {"spec": spec, "fixture": fixture, "visuals": visuals, "session": session}
+        payload = {"spec": spec, "fixture": fixture, "visuals": visuals, "session": session, "sim": data}
         if force_map:
             payload["map"] = force_map
         return client.request("test", payload, deadline_at)

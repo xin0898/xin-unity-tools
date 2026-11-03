@@ -17,7 +17,7 @@ Rules (see the unity-long-jobs skill and the vault page Implementation/UnityBrok
   - compiles coalesce (5 s quiet, 30 s max); with two or more active sessions an offline compile gates them;
     a broken compile gives exit 5 to the sessions whose files are broken and exit 7 (stale build) to others
     that still have their own uncompiled files
-  - AI-test requests with the same key (map, session, visuals) share one Play session
+  - AI-test requests with the same key (map, session, visuals, data backend) share one Play session
 """
 import contextlib
 import io
@@ -45,6 +45,7 @@ MAIN_OPS = {"eval", "compile", "test", "lease_play", "lease_edit", "lease_releas
 EXCLUSIVE_OPS = {"compile", "test", "lease_play", "lease_edit", "restore_scene"}
 ADMIN_OPS = {"pause", "resume", "release_force", "session_end", "stop", "ping"}
 COMPILE_INPUT_EXT = (".cs", ".asmdef", ".asmref", ".rsp", ".dll")
+SUITES_DIR = "Assets/XinWorkArea/Tests/AITests/Suites"  # named AI-test suites (<name>.json); config key "suitesDir"
 STRUCTURAL_EXT = (".asmdef", ".asmref", ".rsp", ".dll")
 
 
@@ -212,7 +213,8 @@ class UnityExecutor:
             maps = set()
             for entry in (res.get("scripts") or []) + (res.get("fixtures") or []):
                 tags = [str(t).lower() for t in (entry.get("tags") or [])]
-                if spec in ("*", "all") or entry.get("name") == spec or spec.lower() in tags:
+                suites = [str(t).lower() for t in (entry.get("suites") or [])]
+                if spec in ("*", "all") or entry.get("name") == spec or spec.lower() in tags or spec.lower() in suites:
                     maps.add(entry.get("map") or "any")
         maps = {default if m in (None, "", "any") else m for m in maps}
         return maps or {default}
@@ -383,6 +385,8 @@ class Broker:
             if req.op in ADMIN_OPS:
                 self.admin(req)
             elif req.op in MAIN_OPS:
+                if req.op == "test":
+                    self.apply_suite(req.payload)
                 if req.op == "test" and req.payload.get("map") and not req.payload.get("maps"):
                     req.payload["maps"] = [req.payload["map"]]  # --map forces one map
                 if req.op == "test" and not req.payload.get("maps"):
@@ -395,6 +399,23 @@ class Broker:
                 self.pending.append(req)
             else:
                 self.respond(req, 64, f"unknown broker op {req.op}")
+
+    def apply_suite(self, payload):
+        """A named suite (SUITES_DIR/<spec>.json in the project) says where it runs: its map, session and backend
+        fill in what the request leaves open."""
+        spec = payload.get("spec") or ""
+        if payload.get("fixture") or not spec or spec.lower().endswith(".json"):
+            return
+        path = os.path.join(self.project, self.ex.cfg.get("suitesDir", SUITES_DIR), spec + ".json")
+        suite = bc.read_json(path, None) if os.path.isfile(path) else None
+        if not isinstance(suite, dict):
+            return
+        if suite.get("map") and suite["map"] != "any" and not payload.get("map"):
+            payload["map"] = suite["map"]
+        if suite.get("session") and not payload.get("session"):
+            payload["session"] = suite["session"]
+        if suite.get("backend") == "data":
+            payload["sim"] = True
 
     def admin(self, req):
         if req.op == "pause":
@@ -615,7 +636,7 @@ class Broker:
         return None
 
     def test_key(self, r):
-        return (r.payload.get("map") or self.ex.cfg["defaultMap"], r.payload.get("session") or "", bool(r.payload.get("visuals")))
+        return (r.payload.get("map") or self.ex.cfg["defaultMap"], r.payload.get("session") or "", bool(r.payload.get("visuals")), bool(r.payload.get("sim")))
 
     # ── main loop ──
     def step(self):
@@ -828,7 +849,7 @@ class Broker:
 
     def do_test(self, reqs):
         key = self.test_key(reqs[0])
-        m, session, visuals = key
+        m, session, visuals, sim = key
         self.set_detail(f"test batch {m}")
         # Fresh code first (one coalesced compile), unless it already failed on exactly this code.
         good, failed, now_snap = self.records.get("good"), self.records.get("failed"), snapshot(self.project)
@@ -857,7 +878,7 @@ class Broker:
                 self.records["priorScene"] = p.get("activeScene")
                 self.save_records()
         self.set_detail(f"test batch {m}: booting")
-        boot_code = f"return AITestAgent.Boot({str(visuals).lower()}, 900f, {json.dumps(session or None) if session else 'null'}, {json.dumps(m)});"
+        boot_code = f"return AITestAgent.Boot({str(visuals).lower()}, 900f, {json.dumps(session or None) if session else 'null'}, {json.dumps(m)}, sim: {str(sim).lower()});"
         rc, text, _ = self.ex.agent_job(boot_code)
         if rc != 0:
             for r in runnable:
