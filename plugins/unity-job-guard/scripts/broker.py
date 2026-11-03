@@ -17,7 +17,7 @@ Rules (see the unity-long-jobs skill and the vault page Implementation/UnityBrok
   - compiles coalesce (5 s quiet, 30 s max); with two or more active sessions an offline compile gates them;
     a broken compile gives exit 5 to the sessions whose files are broken and exit 7 (stale build) to others
     that still have their own uncompiled files
-  - AI-test requests with the same key (map, session, visuals, data backend) share one Play session
+  - AI-test requests with the same key (map, session, visuals, backend: data by default) share one Play session
 """
 import contextlib
 import io
@@ -402,7 +402,12 @@ class Broker:
 
     def apply_suite(self, payload):
         """A named suite (SUITES_DIR/<spec>.json in the project) says where it runs: its map, session and backend
-        fill in what the request leaves open."""
+        fill in what the request leaves open. The backend is data unless the request or the suite says play."""
+        self.read_suite(payload)
+        if "backend" in payload:
+            payload["sim"] = payload.get("backend") != "play"
+
+    def read_suite(self, payload):
         spec = payload.get("spec") or ""
         if payload.get("fixture") or not spec or spec.lower().endswith(".json"):
             return
@@ -414,8 +419,8 @@ class Broker:
             payload["map"] = suite["map"]
         if suite.get("session") and not payload.get("session"):
             payload["session"] = suite["session"]
-        if suite.get("backend") == "data":
-            payload["sim"] = True
+        if suite.get("backend") in ("data", "play") and not payload.get("backend"):
+            payload["backend"] = suite["backend"]
 
     def admin(self, req):
         if req.op == "pause":
@@ -924,16 +929,20 @@ class Broker:
     def respond_test(self, r, parts):
         """One answer for a test request that may have run on two maps. A test reported "not run" on one map counts
         only if it did not run on the other one either."""
+        hint = ""
+        if r.payload.get("sim") and any(q["notRun"] for q in parts):
+            hint = ("\nTests reported not run may need the full scene: `ujob test ... --play` runs them "
+                    "(final verification: ask the user first).")
         if len(parts) == 1:
             q = parts[0]
-            self.respond(r, q["rc"], q["text"], {"result": q["result"], "notRun": q["notRun"]})
+            self.respond(r, q["rc"], q["text"] + hint, {"result": q["result"], "notRun": q["notRun"]})
             return
         order = {0: 0, bc.EXIT_STALE: 1, 1: 2, 3: 3, 2: 4, 4: 5, 5: 6}
         rcs = [q["rc"] for q in parts]
         # "ERROR NOT RUN" (all tests on the other map) is rc 1 for that pass; it is not a failure if the other ran.
         effective = [q["rc"] for q in parts if not (q["rc"] == 1 and q["notRun"] and q["notRun"] == q["total"])]
         rc = max(effective or rcs, key=lambda x: order.get(x, 9))
-        text = "\n\n".join(f"-- map {q['map']} --\n{q['text']}" for q in parts)
+        text = "\n\n".join(f"-- map {q['map']} --\n{q['text']}" for q in parts) + hint
         self.respond(r, rc, text, {"results": [q["result"] for q in parts]})
 
     def take_joiners(self, key):
