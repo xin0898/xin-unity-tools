@@ -19,6 +19,7 @@ Stops Claude Code from waiting forever on Unity.
   - **read-only lookups** (`ujob run --read`) never wait.
 
   New exit codes: 6 (not started, reason printed) and 7 (ran on a stale build: not validated). `ujob status` shows who holds the editor.
+- **Memory gate and restart (0.6.0)**: a request that would enter Play is refused (exit 6) when free commit memory is too low (full map scene: under 20 GB free; test map or data backend: under 10 GB) and runs with a warning under 30 GB, above 30 GB editor memory or after 24 h uptime. At the commit limit, leaving Play can fail to read the scene backup, close the editor and lose unsaved scenes. `ujob memory` shows the reading; `ujob restart [--save|--backup|--discard]` quits and starts the editor in the main lane, after the user chose what happens to unsaved scenes. Thresholds: `"broker": {"memory": {...}}` in `ProjectSettings/UnityBrokerProbe.json`.
 - **Unity probe package** (`unity/com.xin.unity-broker-probe`, installed into a project with `ujob broker setup`): reports the editor's real state to the broker and keeps automatic asset refresh off. Project specifics go in `ProjectSettings/UnityBrokerProbe.json`.
 - **Offline checks**: `ujob offline-compile` / `ujob offline-test` compile and run pure Edit Mode tests without the editor.
 - **Broker hooks**: register and end sessions, remind lease holders, record which session wrote each script, keep Play/scene/compile-triggering Unity MCP calls to the lease holder (failing closed) and block raw `unity command eval/recompile` that bypasses the broker.

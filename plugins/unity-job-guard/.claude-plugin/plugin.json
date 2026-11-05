@@ -1,6 +1,6 @@
 {
   "name": "unity-job-guard",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Stops Claude from waiting forever on Unity: detached Unity CLI jobs that always return, heartbeat-checked waits for multi-frame work, a block on blind sleep-poll loops and delayCall fire-and-forget code, and bounded-wait guidance after busy/unreachable Unity MCP replies.",
   "author": {
     "name": "xindi"

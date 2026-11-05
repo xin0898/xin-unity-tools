@@ -91,6 +91,40 @@ class FakeExec:
         self.calls.append(("open", path))
         return 0, path
 
+    # memory and restart
+    mem = None  # None = not measured (never gated)
+
+    def memory(self):
+        return dict(self.mem) if self.mem else None
+
+    def save_open_scenes(self):
+        self.calls.append(("save_scenes",))
+        for s in self.probe_state["scenes"]:
+            s["dirty"] = False
+        return True, "saved"
+
+    def backup_dirty_scenes(self, folder):
+        self.calls.append(("backup_scenes", folder))
+        return True, folder + "/Dev.unity"
+
+    def editor_image(self, pid):
+        return "C:/Unity/Editor/Unity.exe"
+
+    def exit_editor(self):
+        self.calls.append(("exit",))
+
+    def wait_exit(self, pid, timeout):
+        return True
+
+    def launch_editor(self, exe):
+        self.calls.append(("launch", exe))
+        return 4242
+
+    def wait_restarted(self, old_pid, deadline=0):
+        self.calls.append(("wait_restarted", old_pid))
+        self.probe_state["editorPid"] = 4242
+        return 0, ""
+
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
@@ -429,3 +463,140 @@ def test_recovery_requeues_once(env):
     br2 = B.Broker(str(project), sdir, ex, clock=clock, threaded=False)
     br2.step()
     assert resp(sdir, "abc")["rc"] == 0
+
+
+# ── memory gate ──
+
+import memory_guard as mg  # noqa: E402
+
+LOW = {"freeCommitGB": 15.0, "commitLimitGB": 127.0, "editorPrivateGB": 32.0, "editorUptimeHours": 47.0}
+FINE = {"freeCommitGB": 60.0, "commitLimitGB": 127.0, "editorPrivateGB": 10.0, "editorUptimeHours": 1.0}
+
+
+def test_memory_assess_levels():
+    assert mg.assess(None) == ("ok", None)
+    assert mg.assess(FINE)[0] == "ok"
+    assert mg.assess(LOW, gate_off=False)[0] == "refuse"
+    assert mg.assess(LOW, light=True, gate_off=False)[0] == "warn"          # 15 GB is enough for the test map
+    assert mg.assess(dict(LOW, freeCommitGB=8.0), light=True, gate_off=False)[0] == "refuse"
+    assert mg.assess(LOW, gate_off=True)[0] == "warn"                       # UJOB_MEMORY_GATE=off
+    assert mg.assess(dict(FINE, editorUptimeHours=30.0))[0] == "warn"
+    assert mg.assess(LOW, {"refuseFreeGB": 12}, gate_off=False)[0] == "warn"  # project threshold
+
+
+def test_memory_gate_refuses_full_scene_play(env, monkeypatch):
+    br, ex, clock, sdir, _ = env
+    monkeypatch.delenv(mg.GATE_OFF_ENV, raising=False)
+    ex.mem = LOW
+    t = submit(sdir, "A", "test", {"spec": "sample", "sim": False, "map": "official"})
+    e = submit(sdir, "A", "eval", {"code": 'return PlayModeAgent.Boot("MapInspection", scene: "official");'})
+    br.step()
+    for rid in (t, e):
+        r = resp(sdir, rid)
+        assert r["rc"] == bc.EXIT_NOT_STARTED and "memory too low" in r["output"]
+    assert not any(c[0] == "agent" for c in ex.calls)
+
+
+def test_memory_gate_lets_light_play_run_with_warning(env, monkeypatch):
+    br, ex, clock, sdir, project = env
+    monkeypatch.delenv(mg.GATE_OFF_ENV, raising=False)
+    br.records["good"] = B.snapshot(str(project))
+    active(sdir, "A")
+    ex.mem = LOW
+    rid = submit(sdir, "A", "test", {"spec": "sample", "sim": True})
+    br.step()
+    r = resp(sdir, rid)
+    assert r["rc"] == 0 and "WARNING memory" in r["output"]
+
+
+def test_memory_gate_ignores_edit_mode_work_and_unmeasured(env):
+    br, ex, clock, sdir, _ = env
+    ex.mem = dict(LOW, freeCommitGB=2.0)
+    a = submit(sdir, "A", "eval", {"code": "Debug.Log(1);"})               # no Play entry: never gated
+    br.step()
+    assert resp(sdir, a)["rc"] == 0
+    ex.mem = None
+    b = submit(sdir, "A", "eval", {"code": 'return PlayModeAgent.Boot("Director", scene: "official");'})
+    br.step()
+    assert resp(sdir, b)["rc"] == 0
+
+
+def test_memory_gate_off_turns_refusal_into_warning(env, monkeypatch):
+    br, ex, clock, sdir, _ = env
+    monkeypatch.setenv(mg.GATE_OFF_ENV, "off")
+    ex.mem = LOW
+    rid = submit(sdir, "A", "eval", {"code": 'return PlayModeAgent.Boot("MapInspection", scene: "official");'})
+    br.step()
+    r = resp(sdir, rid)
+    assert r["rc"] == 0 and "WARNING" in r["output"]
+
+
+# ── restart ──
+
+def dirty_dev(ex):
+    ex.probe_state.update({"editorPid": 1111, "activeScene": "Assets/Dev.unity",
+                           "scenes": [{"path": "Assets/Dev.unity", "dirty": True}]})
+
+
+def test_restart_asks_about_unsaved_scenes(env):
+    br, ex, clock, sdir, _ = env
+    dirty_dev(ex)
+    rid = submit(sdir, "A", "restart", {"scenes": "ask"})
+    br.step()
+    r = resp(sdir, rid)
+    assert r["rc"] == bc.EXIT_NOT_STARTED and "Assets/Dev.unity" in r["output"] and "--backup" in r["output"]
+    assert ("exit",) not in ex.calls
+
+
+def test_restart_refused_in_play_and_with_dirty_prefab(env):
+    br, ex, clock, sdir, _ = env
+    ex.probe_state.update({"editorPid": 1111, "playing": True})
+    a = submit(sdir, "A", "restart", {"scenes": "discard"})
+    br.step()
+    assert resp(sdir, a)["rc"] == bc.EXIT_NOT_STARTED and "Play Mode" in resp(sdir, a)["output"]
+    ex.probe_state.update({"playing": False, "prefabStageDirty": True, "prefabStagePath": "Assets/P.prefab"})
+    b = submit(sdir, "A", "restart", {"scenes": "discard"})
+    br.step()
+    assert resp(sdir, b)["rc"] == bc.EXIT_NOT_STARTED and "Prefab Mode" in resp(sdir, b)["output"]
+    assert ("exit",) not in ex.calls
+
+
+def test_restart_backup_then_relaunch(env):
+    br, ex, clock, sdir, _ = env
+    dirty_dev(ex)
+    rid = submit(sdir, "A", "restart", {"scenes": "backup"})
+    br.step()
+    r = resp(sdir, rid)
+    assert r["rc"] == 0 and "1111 -> 4242" in r["output"] and "backed up" in r["output"]
+    names = [c[0] for c in ex.calls]
+    assert names.index("backup_scenes") < names.index("exit") < names.index("launch") < names.index("wait_restarted")
+    assert ("save_scenes",) not in ex.calls
+
+
+def test_restart_save_and_clean(env):
+    br, ex, clock, sdir, _ = env
+    dirty_dev(ex)
+    a = submit(sdir, "A", "restart", {"scenes": "save"})
+    br.step()
+    assert resp(sdir, a)["rc"] == 0 and ("save_scenes",) in ex.calls
+    ex.calls.clear()
+    ex.probe_state["editorPid"] = 1111                                     # clean editor: no choice needed
+    b = submit(sdir, "A", "restart", {})
+    br.step()
+    assert resp(sdir, b)["rc"] == 0 and ("exit",) in ex.calls and ("save_scenes",) not in ex.calls
+
+
+def test_restart_releases_the_callers_lease_and_waits_for_others(env):
+    br, ex, clock, sdir, _ = env
+    ex.probe_state["editorPid"] = 1111
+    br.take_lease("A", "edit", False)
+    a = submit(sdir, "A", "restart", {})
+    br.step()
+    assert resp(sdir, a)["rc"] == 0 and br.lease is None
+    br.take_lease("B", "edit", False)
+    c = submit(sdir, "A", "restart", {})
+    br.step()
+    assert resp(sdir, c) is None                                           # blocked by B's lease
+    clock.advance(bc.BLOCKED_WAIT + 1)
+    br.step()
+    assert resp(sdir, c)["rc"] == bc.EXIT_NOT_STARTED and "leased by" in resp(sdir, c)["output"]

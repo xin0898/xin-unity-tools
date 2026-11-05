@@ -18,6 +18,9 @@ Rules (see the unity-long-jobs skill and the vault page Implementation/UnityBrok
     a broken compile gives exit 5 to the sessions whose files are broken and exit 7 (stale build) to others
     that still have their own uncompiled files
   - AI-test requests with the same key (map, session, visuals, backend: data by default) share one Play session
+  - memory gate: a request that would enter Play is refused (exit 6) when free commit memory is below the
+    threshold (memory_guard.py), and runs with a warning when it is getting low; `ujob restart` restarts the editor
+    in the main lane after the caller chose what happens to unsaved scenes
 """
 import contextlib
 import io
@@ -33,6 +36,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import broker_common as bc  # noqa: E402
+import memory_guard as mg  # noqa: E402
 
 IDLE_EXIT = 900
 COMPILE_QUIET, COMPILE_MAX = 5.0, 30.0
@@ -41,8 +45,9 @@ IDLE_WARN, IDLE_RELEASE = 25 * 60, 30 * 60
 IMPLICIT_GRACE = 5.0
 PROBE_STALE = 15.0
 RESPONSE_TTL = 3600
-MAIN_OPS = {"eval", "compile", "test", "lease_play", "lease_edit", "lease_release", "import", "restore_scene"}
-EXCLUSIVE_OPS = {"compile", "test", "lease_play", "lease_edit", "restore_scene"}
+MAIN_OPS = {"eval", "compile", "test", "lease_play", "lease_edit", "lease_release", "import", "restore_scene", "restart"}
+EXCLUSIVE_OPS = {"compile", "test", "lease_play", "lease_edit", "restore_scene", "restart"}
+RESTART_SCENE_MODES = ("ask", "save", "backup", "discard")
 ADMIN_OPS = {"pause", "resume", "release_force", "session_end", "stop", "ping"}
 COMPILE_INPUT_EXT = (".cs", ".asmdef", ".asmref", ".rsp", ".dll")
 SUITES_DIR = "Assets/XinWorkArea/Tests/AITests/Suites"  # named AI-test suites (<name>.json); config key "suitesDir"
@@ -59,6 +64,7 @@ def load_config(project):
         "maps": b.get("maps") or {},
         "defaultMap": b.get("defaultMap") or "test",
         "aitest": b.get("aitest", True),
+        "memory": b.get("memory") or {},
     }
 
 
@@ -252,6 +258,55 @@ class UnityExecutor:
                         for m in re.finditer(r"^(.*?)\(\d+,\d+\): error", text, re.M)})
         return rc, text, files
 
+    # ── memory and restart (memory_guard.py) ──
+    def memory(self):
+        p = self.probe() or {}
+        try:
+            return mg.read(p.get("editorPid"), p.get("editorStartUnix"))
+        except Exception:
+            return None
+
+    def save_open_scenes(self):
+        ok, res = self.quick('return UnityEditor.SceneManagement.EditorSceneManager.SaveOpenScenes() ? "saved" : "NOT SAVED";', timeout=600)
+        return ok and res == "saved", str(res)
+
+    def backup_dirty_scenes(self, folder):
+        """Saves a copy of every dirty loaded scene into `folder` (outside Assets); the scenes on disk are untouched."""
+        code = ('var dir = ' + json.dumps(folder.replace("\\", "/")) + '; System.IO.Directory.CreateDirectory(dir); '
+                'var done = new System.Collections.Generic.List<string>(); '
+                'for (int i = 0; i < UnityEngine.SceneManagement.SceneManager.sceneCount; i++) { '
+                'var s = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i); if (!s.isDirty) continue; '
+                'var name = string.IsNullOrEmpty(s.path) ? "Untitled_" + i : System.IO.Path.GetFileNameWithoutExtension(s.path); '
+                'var dst = dir + "/" + name + ".unity"; '
+                'if (!UnityEditor.SceneManagement.EditorSceneManager.SaveScene(s, dst, true)) return "FAILED " + dst; done.Add(dst); } '
+                'return string.Join("\\n", done);')
+        ok, res = self.quick(code, timeout=900)
+        return ok and not str(res).startswith("FAILED"), str(res)
+
+    def editor_image(self, pid):
+        return mg.process_image(pid)
+
+    def exit_editor(self):
+        """Asks the editor to quit without saving. The call usually returns no answer: the editor is gone."""
+        self.quick("UnityEditor.EditorApplication.Exit(0); return \"exiting\";", timeout=30)
+
+    def wait_exit(self, pid, timeout):
+        return mg.wait_exit(pid, timeout)
+
+    def launch_editor(self, exe):
+        return mg.launch_editor(exe, self.project)
+
+    def wait_restarted(self, old_pid, deadline=900):
+        """Waits until a new editor writes the probe and is ready. Returns (rc, text); rc None/0 = ready."""
+        end = time.time() + deadline
+        while time.time() < end:
+            p = self.probe()
+            if p and p.get("fresh") and p.get("editorPid") and p.get("editorPid") != old_pid:
+                rc, text = self.wait_ready(max(60, end - time.time()))
+                return (rc or 0), text
+            time.sleep(2)
+        return 4, f"no new editor reported in {deadline} s (is a dialog open, or did Unity Hub ask for something?)"
+
 
 # ── The broker ───────────────────────────────────────────────────────────────────────────────────
 
@@ -265,6 +320,7 @@ class Request:
         self.submitted = doc.get("submitted") or time.time()
         self.blocked_since = None
         self.reason = None
+        self.warn = None            # a memory warning to print with the answer
         self.attempts = doc.get("attempts", 0)
 
     @property
@@ -274,6 +330,19 @@ class Request:
     @property
     def enters_play(self):
         return self.op == "eval" and bc.enters_play_or_scene(self.payload.get("code") or self.payload.get("file_text"))
+
+    @property
+    def light_play(self):
+        """The Play entry loads no full map scene: the test map, or the data backend's sim scene of the test map.
+        Anything not clearly light counts as heavy (an eval's Boot may load the open official scene)."""
+        if self.op == "test":
+            return (self.payload.get("map") or "test") == "test" and bool(self.payload.get("sim"))
+        if self.op == "lease_play":
+            return self.payload.get("scene") in ("test", "sim-test")
+        code = self.payload.get("code") or self.payload.get("file_text") or ""
+        if "official" in code:
+            return False
+        return "SimAgent.Boot(" in code or '"sim-test"' in code or 'scene: "test"' in code
 
 
 class Broker:
@@ -353,6 +422,8 @@ class Broker:
     def respond(self, req, rc, text, extra=None):
         if isinstance(req, _Internal):
             return
+        if getattr(req, "warn", None) and rc != bc.EXIT_NOT_STARTED:
+            text = f"[broker] WARNING {req.warn}\n{text}"
         self._write_response(req.id, req.doc.get("key"), rc, text, extra)
         self.journal(ev="done", id=req.id, op=req.op, session=req.session, rc=rc)
         self.log(f"done {req.id} {req.op} {req.session[:8]} rc={rc}")
@@ -584,6 +655,11 @@ class Broker:
                 return "NOW:you are in Play Mode under your lease; stop Play first (compiles never run during Play)"
             if r.op in ("lease_play", "lease_edit"):
                 return "NOW:you already hold the editor lease"
+        if r.op in ("test", "lease_play") or r.enters_play:
+            level, text = mg.assess(self.ex.memory(), self.ex.cfg.get("memory"), light=r.light_play)
+            if level == "refuse":
+                return "NOW:" + text
+            r.warn = text if level == "warn" else None
         if r.op in EXCLUSIVE_OPS or r.enters_play:
             busy = self.busy_runners(p)
             if busy:
@@ -986,7 +1062,7 @@ class Broker:
             self.records["priorScene"] = p0.get("activeScene")
             self.save_records()
         if variant == "director":
-            code = "return DirectorAgent.Boot();"
+            code = f"return DirectorAgent.Boot(900f, {json.dumps(scene or 'official')});"
         elif variant == "aitest":
             code = f"return AITestAgent.Boot({str(bool(r.payload.get('visuals'))).lower()}, 900f, {json.dumps(r.payload.get('session')) if r.payload.get('session') else 'null'}, {json.dumps(scene or self.ex.cfg['defaultMap'])});"
         else:
@@ -1044,6 +1120,84 @@ class Broker:
             self.records.pop("priorScene", None)
             self.save_records()
         self.respond(r, rc, f"reopened {prior}" if rc == 0 else text)
+
+    def do_restart(self, reqs):
+        """Quit and start the editor again. Unsaved scenes need the caller's choice (the user's, not the agent's):
+        save them, back them up as copies (TempArtifacts/Backups/Scenes/<stamp>/) or discard them."""
+        r = reqs[0]
+        mode = r.payload.get("scenes") or "ask"
+        if mode not in RESTART_SCENE_MODES:
+            self.respond(r, 64, f"restart: unknown scene choice '{mode}' ({', '.join(RESTART_SCENE_MODES)})")
+            return
+        p = self.ex.probe()
+        if not p or not p.get("fresh") or not p.get("editorPid"):
+            self.respond(r, bc.EXIT_NOT_STARTED, "not started: the editor is not answering (no fresh probe), so its unsaved "
+                                                 "scenes cannot be checked. Restart it by hand.")
+            return
+        if p.get("playing"):
+            self.respond(r, bc.EXIT_NOT_STARTED, "not started: the editor is in Play Mode. Stop Play first "
+                                                 "(`ujob lease release`, or PlayModeAgent.Stop()), then restart.")
+            return
+        dirty = [s.get("path") or "(untitled scene)" for s in p.get("scenes") or [] if s.get("dirty")]
+        if p.get("prefabStageDirty"):
+            self.respond(r, bc.EXIT_NOT_STARTED, "not started: Prefab Mode has unsaved changes in "
+                                                 f"{p.get('prefabStagePath') or '?'}. Ask the user to save or close it first.")
+            return
+        if dirty and mode == "ask":
+            self.respond(r, bc.EXIT_NOT_STARTED,
+                         "not started: unsaved scenes: " + ", ".join(dirty) + ". Ask the user what to do with them, then run "
+                         "`ujob restart --save` (save them over the scene files), `--backup` (save copies to "
+                         "TempArtifacts/Backups/Scenes/, leave the scene files as they are) or `--discard`. A dirty flag alone "
+                         "does not prove an edit: test batches can mark a scene dirty.")
+            return
+        old_pid = p["editorPid"]
+        exe = self.ex.editor_image(old_pid)
+        if not exe:
+            self.respond(r, 4, f"restart: could not read the editor's executable (pid {old_pid}); nothing was changed")
+            return
+        before = self.ex.memory()
+        notes = []
+        if dirty and mode == "save":
+            self.set_detail("restart: saving scenes")
+            ok, res = self.ex.save_open_scenes()
+            if not ok:
+                self.respond(r, 1, f"restart stopped: saving the scenes failed ({res}); the editor keeps running")
+                return
+            notes.append("saved: " + ", ".join(dirty))
+        elif dirty and mode == "backup":
+            self.set_detail("restart: backing up scenes")
+            folder = os.path.join(self.project, "TempArtifacts", "Backups", "Scenes", time.strftime("%Y%m%d-%H%M%S"))
+            ok, res = self.ex.backup_dirty_scenes(folder)
+            if not ok:
+                self.respond(r, 1, f"restart stopped: backing up the scenes failed ({res}); the editor keeps running")
+                return
+            notes.append("backed up (scene files unchanged): " + res.replace("\n", ", "))
+        elif dirty:
+            notes.append("discarded unsaved changes in: " + ", ".join(dirty))
+        others = sorted(s[:8] for s in self.active_sessions() if s != r.session)
+        self.set_detail("restart: closing the editor")
+        self.log(f"restart by {r.session[:8]}: editor pid {old_pid} ({mode})")
+        t0 = self.now()
+        self.ex.exit_editor()
+        if not self.ex.wait_exit(old_pid, 180):
+            self.respond(r, 4, f"restart: the editor (pid {old_pid}) did not close within 180 s. A dialog may be open; "
+                               "look at the editor. Nothing was relaunched.")
+            return
+        self.set_detail("restart: starting the editor")
+        new_pid = self.ex.launch_editor(exe)
+        rc, text = self.ex.wait_restarted(old_pid, 900)
+        with self.lock:
+            if self.lease and self.lease["session"] == r.session:
+                self.release_lease("editor restarted")
+        after = self.ex.memory()
+        lines = [f"editor restarted in {int(self.now() - t0)} s: pid {old_pid} -> {new_pid}"] + notes
+        lines.append(f"memory before: {mg.describe(before)}")
+        lines.append(f"memory after: {mg.describe(after)}")
+        if others:
+            lines.append(f"other active sessions (their next calls wait for the editor): {', '.join(others)}")
+        if rc:
+            lines.append("the new editor is not ready yet: " + (text or "").strip()[-400:])
+        self.respond(r, rc or 0, "\n".join(lines))
 
     # ── state for `ujob status` and the hooks ──
     def write_state(self):

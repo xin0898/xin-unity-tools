@@ -23,6 +23,12 @@ Editor work (through the broker):
   ujob lease edit [--why TEXT]             hold the editor for hands-on work (captures, perf windows, debugging,
   ujob lease release                       long edit jobs). Nobody else's mutating work runs until you release it.
   ujob import PATH...                      import non-script assets (automatic refresh is off)
+  ujob restart [--save | --backup | --discard]
+                                           quit and start the editor again (main lane: waits for running work; refused
+                                           in Play or Prefab Mode with unsaved changes). Unsaved scenes need a choice,
+                                           which is the USER's to make: --save writes them, --backup saves copies to
+                                           TempArtifacts/Backups/Scenes/<stamp>/ and leaves the scene files as they are,
+                                           --discard drops them. Without one, dirty scenes give exit 6 with their list.
   ujob wait T-TICKET                       keep waiting on a broker request that hit its deadline
 
 Waits and checks (direct, no broker):
@@ -39,7 +45,14 @@ Waits and checks (direct, no broker):
 
 Coordination:
   ujob status [--json]                     sessions, lease holder and idle time, queue, running work, editor
-                                           state from the probe, broken files, pause state
+                                           state from the probe, broken files, pause state, memory
+  ujob memory                              free commit memory, the editor's private memory and uptime, and whether
+                                           a Play entry would pass the broker's memory gate (instant, no broker).
+                                           The gate refuses Play entry with exit 6 when memory is too low (full map
+                                           scene: under 20 GB commit free; test map / data backend: under 10 GB) and
+                                           warns under 30 GB, above 30 GB editor memory or after 24 h uptime.
+                                           Thresholds: "broker": {"memory": {...}} in ProjectSettings/UnityBrokerProbe.json;
+                                           UJOB_MEMORY_GATE=off turns refusals into warnings (only when the user says so).
   ujob register --role ROLE --brief TEXT   say what this session does (coordination|implementation|testing)
   ujob broker start|stop|pause|resume|log|restore-scene|setup [--restore]|release --force|session-end [SESSION]
 
@@ -71,6 +84,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker_common as bc  # noqa: E402
+import memory_guard as mg  # noqa: E402
 import unity_cli as uc  # noqa: E402
 
 SELF = uc.SELF
@@ -265,7 +279,22 @@ def status(project, as_json):
             say(f"  probe: {prob}")
     else:
         say("editor: no probe state (run `ujob broker setup`, then `ujob compile`)")
+    say(memory_line(project, probe))
     return 0
+
+
+def memory_line(project, probe=None):
+    probe = probe if probe is not None else bc.read_json(os.path.join(project, "Library", "UnityBrokerProbe", "state.json"))
+    probe = probe or {}
+    mem = mg.read(probe.get("editorPid"), probe.get("editorStartUnix"))
+    if not mem:
+        return "memory: not measured (Windows only)"
+    cfg = ((bc.read_json(os.path.join(project, "ProjectSettings", "UnityBrokerProbe.json"), {}) or {}).get("broker") or {}).get("memory")
+    heavy, heavy_text = mg.assess(mem, cfg, light=False)
+    light, _ = mg.assess(mem, cfg, light=True)
+    verdict = {"ok": "OK", "warn": "LOW", "refuse": "TOO LOW"}
+    line = f"memory: {mg.describe(mem)}; Play on a full map: {verdict[heavy]}, test map / data backend: {verdict[light]}"
+    return line + (f"\n  {heavy_text}" if heavy_text else "")
 
 
 # ── Setup ────────────────────────────────────────────────────────────────────────────────────────
@@ -355,6 +384,10 @@ def main(argv):
 def dispatch(verb, args, project, ident, act, deadline_at, started):
     if verb == "status":
         return status(project, take_flag(args, "--json"))
+
+    if verb == "memory":
+        say(memory_line(project))
+        return 0
 
     if verb == "register":
         role, brief = take_opt(args, "--role"), take_opt(args, "--brief")
@@ -468,6 +501,13 @@ def dispatch(verb, args, project, ident, act, deadline_at, started):
             return client.request("lease_release", {}, deadline_at)
         say("lease play|edit|release")
         return 64
+
+    if verb == "restart":
+        choices = [m for m in ("save", "backup", "discard") if take_flag(args, "--" + m)]
+        if len(choices) > 1:
+            say("restart takes one of --save, --backup, --discard")
+            return 64
+        return client.request("restart", {"scenes": choices[0] if choices else "ask"}, deadline_at)
 
     if verb == "import":
         if not args:
