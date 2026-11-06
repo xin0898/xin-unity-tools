@@ -51,10 +51,60 @@ def unity_install(project):
     cands += [rf"C:\Program Files\Unity\Hub\Editor\{ver}\Editor\Data",
               f"/Applications/Unity/Hub/Editor/{ver}/Unity.app/Contents",
               os.path.expanduser(f"~/Unity/Hub/Editor/{ver}/Editor/Data")]
+    cands += hub_editor_data_dirs(ver)
     for d in cands:
         if d and os.path.isfile(os.path.join(d, "DotNetSdkRoslyn", "csc.dll")):
             return d
     return None
+
+
+def _editor_data_dir(editor_root):
+    """<install>/<ver> or the editor executable -> its Data folder (Windows/Linux) or Contents (macOS)."""
+    p = editor_root.rstrip("/\\")
+    if p.lower().endswith((".exe", "/unity")):
+        p = os.path.dirname(p)                        # .../Editor/Unity.exe -> .../Editor
+    if p.endswith(".app"):
+        return os.path.join(p, "Contents")
+    if os.path.basename(p).lower() == "editor":
+        return os.path.join(p, "Data")
+    if os.path.isdir(os.path.join(p, "Unity.app")):
+        return os.path.join(p, "Unity.app", "Contents")
+    return os.path.join(p, "Editor", "Data")
+
+
+def hub_editor_data_dirs(ver):
+    """Editor folders Unity Hub knows about: its custom install path and the editors it has registered.
+    Hub installs to C:\\Program Files\\Unity\\Hub\\Editor unless the user changed it (e.g. D:\\UnityEditors)."""
+    hub_dirs = [os.path.join(os.environ.get("APPDATA", ""), "UnityHub") if os.environ.get("APPDATA") else None,
+                os.path.expanduser("~/Library/Application Support/UnityHub"),
+                os.path.expanduser("~/.config/UnityHub")]
+    out = []
+    for hub in hub_dirs:
+        if not hub or not os.path.isdir(hub):
+            continue
+        try:
+            with open(os.path.join(hub, "secondaryInstallPath.json"), encoding="utf-8") as f:
+                root = json.load(f)
+            if isinstance(root, str) and root and ver:
+                out.append(_editor_data_dir(os.path.join(root, ver)))
+        except (OSError, ValueError):
+            pass
+        for name in ("editors-v2.json", "editors.json"):
+            try:
+                with open(os.path.join(hub, name), encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            stack = [data]
+            while stack:                                  # any path string that names this version
+                x = stack.pop()
+                if isinstance(x, dict):
+                    stack.extend(x.values())
+                elif isinstance(x, list):
+                    stack.extend(x)
+                elif isinstance(x, str) and ver and ver in x and os.path.exists(x):
+                    out.append(_editor_data_dir(x))
+    return out
 
 
 def find_dag(project):
@@ -179,7 +229,7 @@ def build(project, opts):
     data = unity_install(project)
     if not data:
         say("NO COMPILER: Unity's DotNetSdkRoslyn/csc.dll for this project's editor version was not found "
-            "(set UNITY_EDITOR_DATA to <editor>/Editor/Data).")
+            "(looked in the Unity Hub install folders; set UNITY_EDITOR_DATA to <editor>/Editor/Data).")
         return (4, ctx)
     dotnet = os.path.join(data, "NetCoreRuntime", "dotnet.exe" if os.name == "nt" else "dotnet")
     if not os.path.isfile(dotnet):

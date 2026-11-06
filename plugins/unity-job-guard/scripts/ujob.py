@@ -331,6 +331,7 @@ def setup(project, client, restore, deadline_at):
         say(f"wrote a config template: {cfg} (add busy flags, boot keys and map scenes)")
     code = ('var old = UnityEditor.EditorPrefs.GetInt("ScriptCompilationDuringPlay", 0); '
             'UnityEditor.EditorPrefs.SetInt("ScriptCompilationDuringPlay", 1); return old.ToString();')
+    failed = []
     ok, res, err = uc.quick_eval(code)
     if ok:
         if not os.path.isfile(backup):
@@ -338,10 +339,19 @@ def setup(project, client, restore, deadline_at):
         say(f"Script Changes While Playing: Recompile After Finished Playing (was {res}; per user, so all your projects)")
     else:
         say(f"could not set the Play-compile preference: {err}")
+        failed.append("Play-compile preference")
     if copied:
         # A new embedded package is only compiled after Package Manager resolves it.
-        uc.quick_eval("UnityEditor.PackageManager.Client.Resolve(); return \"resolve requested\";")
-        say("Now run `ujob compile --force` so Unity loads the probe.")
+        ok, _, err = uc.quick_eval("UnityEditor.PackageManager.Client.Resolve(); return \"resolve requested\";")
+        if ok:
+            say("Now run `ujob compile --force` so Unity loads the probe.")
+        else:
+            say(f"could not ask Package Manager to resolve the probe package: {err}")
+            failed.append("package resolve")
+    if failed:
+        say(f"SETUP INCOMPLETE: {', '.join(failed)} failed. Fix the cause and run `ujob broker setup` again "
+            "(it is safe to repeat). If Unity still does not load the probe, restart the editor.")
+        return 1
     return 0
 
 
